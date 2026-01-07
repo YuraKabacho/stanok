@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Керування двигунами ESP32</title>
+    <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>Керування двигунами ESP32</h1>
+            <p>Інтерфейс для контролю 4 двигунів та сервоприводу</p>
+            <div class="status-bar">
+                <span>Статус: <span id="global-status">ПІДКЛЮЧЕНО</span></span>
+                <span>IP: <span id="ip-address">---</span></span>
+            </div>
+        </header>
+        
+        <div class="dashboard">
+            <!-- Двигун 1 -->
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">Двигун 1 (Піни: 15, 14)</span>
+                    <span class="motor-status status-inactive">Неактивний</span>
+                </div>
+                <div class="control-group">
+                    <label class="control-label">Поточна позиція (мм)</label>
+                    <div class="value-display" id="motor0-position">0</div>
+                </div>
+                <div class="control-group">
+                    <label class="control-label">Цільова позиція (мм)</label>
+                    <div class="slider-container">
+                        <input type="range" min="0" max="20" value="0" class="slider" id="motor0-target">
+                        <span id="motor0-target-value">0</span>
+                    </div>
+                </div>
+                <div class="btn-group">
+                    <button class="btn btn-primary" id="motor0-set">Встановити</button>
+                    <button class="btn btn-success" id="motor0-calibrate">Калібрувати</button>
+                </div>
+                <div class="btn-group">
+                    <button class="btn btn-warning motor-full-forward" data-motor="0">Повний вперед</button>
+                    <button class="btn btn-warning motor-full-backward" data-motor="0">Повний назад</button>
+                </div>
+            </div>
+            
+            <!-- Двигун 2 -->
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">Двигун 2 (Піни: 13, 12)</span>
+                    <span class="motor-status status-inactive">Неактивний</span>
+                </div>
+                <div class="control-group">
+                    <label class="control-label">Поточна позиція (мм)</label>
+                    <div class="value-display" id="motor1-position">0</div>
+                </div>
+                <div class="control-group">
+                    <label class="control-label">Цільова позиція (мм)</label>
+                    <div class="slider-container">
+                        <input type="range" min="0" max="20" value="0" class="slider" id="motor1-target">
+                        <span id="motor1-target-value">0</span>
+                    </div>
+                </div>
+                <div class="btn-group">
+                    <button class="btn btn-primary" id="motor1-set">Встановити</button>
+                    <button class="btn btn-success" id="motor1-calibrate">Калібрувати</button>
+                </div>
+                <div class="btn-group">
+                    <button class="btn btn-warning motor-full-forward" data-motor="1">Повний вперед</button>
+                    <button class="btn btn-warning motor-full-backward" data-motor="1">Повний назад</button>
+                </div>
+            </div>
+            
+            <!-- Двигун 3 -->
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">Двигун 3 (Піни: 27, 26)</span>
+                    <span class="motor-status status-inactive">Неактивний</span>
+                </div>
+                <div class="control-group">
+                    <label class="control-label">Поточна позиція (мм)</label>
+                    <div class="value-display" id="motor2-position">0</div>
+                </div>
+                <div class="control-group">
+                    <label class="control-label">Цільова позиція (мм)</label>
+                    <div class="slider-container">
+                        <input type="range" min="0" max="20" value="0" class="slider" id="motor2-target">
+                        <span id="motor2-target-value">0</span>
+                    </div>
+                </div>
+                <div class="btn-group">
+                    <button class="btn btn-primary" id="motor2-set">Встановити</button>
+                    <button class="btn btn-success" id="motor2-calibrate">Калібрувати</button>
+                </div>
+                <div class="btn-group">
+                    <button class="btn btn-warning motor-full-forward" data-motor="2">Повний вперед</button>
+                    <button class="btn btn-warning motor-full-backward" data-motor="2">Повний назад</button>
+                </div>
+            </div>
+            
+            <!-- Двигун 4 -->
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">Двигун 4 (Піни: 5, 23)</span>
+                    <span class="motor-status status-inactive">Неактивний</span>
+                </div>
+                <div class="control-group">
+                    <label class="control-label">Поточна позиція (мм)</label>
+                    <div class="value-display" id="motor3-position">0</div>
+                </div>
+                <div class="control-group">
+                    <label class="control-label">Цільова позиція (мм)</label>
+                    <div class="slider-container">
+                        <input type="range" min="0" max="20" value="0" class="slider" id="motor3-target">
+                        <span id="motor3-target-value">0</span>
+                    </div>
+                </div>
+                <div class="btn-group">
+                    <button class="btn btn-primary" id="motor3-set">Встановити</button>
+                    <button class="btn btn-success" id="motor3-calibrate">Калібрувати</button>
+                </div>
+                <div class="btn-group">
+                    <button class="btn btn-warning motor-full-forward" data-motor="3">Повний вперед</button>
+                    <button class="btn btn-warning motor-full-backward" data-motor="3">Повний назад</button>
+                </div>
+            </div>
+            
+            <!-- Группове управління -->
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">Группове управління</span>
+                </div>
+                <div class="control-group">
+                    <label class="control-label">Цільова позиція для всіх двигунів (мм)</label>
+                    <div class="slider-container">
+                        <input type="range" min="0" max="20" value="0" class="slider" id="all-motors-target">
+                        <span id="all-motors-target-value">0</span>
+                    </div>
+                </div>
+                <div class="btn-group" style="grid-template-columns: 1fr;">
+                    <button class="btn btn-primary" id="all-motors-set">Встановити для всіх</button>
+                    <button class="btn btn-success" id="all-motors-calibrate">Калібрувати всі</button>
+                    <button class="btn btn-warning" id="all-full-forward">Всі повний вперед</button>
+                    <button class="btn btn-warning" id="all-full-backward">Всі повний назад</button>
+                    <button class="btn btn-danger" id="emergency-stop">Аварійна зупинка</button>
+                </div>
+            </div>
+            
+            <!-- Сервопривід -->
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">Сервопривід (Піни: 18,19)</span>
+                    <span class="motor-status status-inactive">Вимкнено</span>
+                </div>
+                <div class="servo-control">
+                    <label class="switch">
+                        <input type="checkbox" id="servo-toggle">
+                        <span class="slider-switch"></span>
+                    </label>
+                    <p style="margin-top: 10px;">Стан: <span id="servo-state">ВИМКНЕНО</span></p>
+                </div>
+            </div>
+            
+        </div>
+    </div>
+    
+    <div class="notification" id="notification">
+        Повідомлення
+    </div>
+
+    <script src="/script.js"></script>
+</body>
+</html>

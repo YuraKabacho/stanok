@@ -1,92 +1,61 @@
 #include <Arduino.h>
-
 #include <Wire.h>
+#include <WiFi.h>
+#include <WiFiManager.h>
+#include <ArduinoOTA.h>
+
+#include <AsyncTCP.h>
+#include <ESPAsyncWebServer.h>
+#include <ArduinoJson.h>
+
+#include <LittleFS.h>
+
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <ESP32Servo.h>
-#include <WiFi.h>
-#include <AsyncTCP.h>
-#include <ESPAsyncWebServer.h>
-#include <WebSocketsServer.h>
-#include <ArduinoJson.h>
-#include <SPIFFS.h>
 
 // ==== OLED ====
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 
-// ==== Encoder pins ====
-#define ENCODER_A 32
-#define ENCODER_B 33
-#define ENCODER_BTN 25
-
-// ==== L298N pins ====
-#define IN1_M1 13
-#define IN2_M1 12
-#define IN1_M2 27
-#define IN2_M2 26
-#define IN1_M3 14
-#define IN2_M3 4
-#define IN1_M4 2
-#define IN2_M4 15
-
-// ==== Limit Switches ====
-#define LIMIT_SWITCH_M1 5
-#define LIMIT_SWITCH_M2 23
-#define LIMIT_SWITCH_M3 35
-#define LIMIT_SWITCH_M4 34
-
-// ==== Servos ====
-Servo myServo1;
-Servo myServo2;
-int servoPin1 = 18;
-int servoPin2 = 19;
-bool servoState = false;
-
-// ==== Wi-Fi Access Point credentials ====
-const char* ssid = "ESP32_Motor_Control";
-const char* password = "12345678";
-
-// ==== Web Server ====
-AsyncWebServer server(80);
-WebSocketsServer webSocket = WebSocketsServer(81);
+// ==== Pin Definitions ====
+const int encoderPins[] = {25, 33, 32}; // CLK, DT, SW
+const int motorPins[4][2] = {
+  {15, 14}, // M1: IN1, IN2
+  {13, 12}, // M2: IN1, IN2
+  {27, 26},  // M3: IN1, IN2
+  {5, 23}   // M4: IN1, IN2
+};
+const int limitPins[] = {2, 4, 35, 34};
+const int servoPins[] = {18, 19};
 
 // ==== Parameters ====
 const int max_mm = 20;
 const int min_mm = 0;
 const int ms_per_mm = 6800;
-
-// ==== Encoder debounce ====
 #define ENCODER_DEBOUNCE 40
-unsigned long lastEncoderUpdate = 0;
 
-// ==== Variables ====
-volatile int8_t encoder_delta = 0;
-unsigned long lastDebounce = 0;
-bool btnPressed = false;
+// ==== Global Variables ====
+Servo myServo1, myServo2;
+bool servoState = false;
+AsyncWebServer server(80);
+AsyncWebSocket ws("/ws");
 
-// Motor variables
+// Motor structure
 struct Motor {
-  int manual_distance;
-  int real_position;
-  int target;
-  bool running;
-  unsigned long move_start_time;
-  int dir;
-  bool fullForward;
-  bool fullBackward;
-  bool calibrating;
-  int limitSwitchPin;
+  int manual_distance = 0;
+  int real_position = 0;
+  int target = 0;
+  bool running = false;
+  unsigned long move_start_time = 0;
+  int dir = 0;
+  bool fullForward = false;
+  bool fullBackward = false;
+  bool calibrating = false;
 };
 
-// Правильний порядок двигунів: 0, 1, 2, 3
-Motor motors[4] = {
-  {0, 0, 0, false, 0, 0, false, false, false, LIMIT_SWITCH_M1}, // Двигун 0
-  {0, 0, 0, false, 0, 0, false, false, false, LIMIT_SWITCH_M2}, // Двигун 1
-  {0, 0, 0, false, 0, 0, false, false, false, LIMIT_SWITCH_M3}, // Двигун 2
-  {0, 0, 0, false, 0, 0, false, false, false, LIMIT_SWITCH_M4}  // Двигун 3
-};
+Motor motors[4];
 
 // Menu variables
 int menu_level = 0;
@@ -95,728 +64,24 @@ int selected_motor = 0;
 int selected_action = 0;
 bool edit_value = false;
 
-// HTML страница как строка
-const char* html_content = R"rawliteral(
-<!DOCTYPE html>
-<html lang="uk">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Керування двигунами ESP32</title>
-    <style>
-        :root {
-            --primary: #2c3e50;
-            --secondary: #3498db;
-            --accent: #e74c3c;
-            --success: #2ecc71;
-            --warning: #f39c12;
-            --light: #ecf0f1;
-            --dark: #34495e;
-            --text: #2c3e50;
-            --bg: #f5f7fa;
-        }
-        
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-        }
-        
-        body {
-            background-color: var(--bg);
-            color: var(--text);
-            padding: 20px;
-            min-height: 100vh;
-        }
-        
-        .container {
-            max-width: 1200px;
-            margin: 0 auto;
-        }
-        
-        header {
-            background: linear-gradient(135deg, var(--primary), var(--secondary));
-            color: white;
-            padding: 20px;
-            border-radius: 10px;
-            margin-bottom: 20px;
-            box-shadow: 0 4px 15px rgba(0, 0, 0, 0.1);
-            text-align: center;
-        }
-        
-        h1 {
-            margin-bottom: 10px;
-            font-size: 2.5rem;
-        }
-        
-        .status-bar {
-            display: flex;
-            justify-content: space-between;
-            background-color: var(--dark);
-            color: white;
-            padding: 10px 15px;
-            border-radius: 5px;
-            margin-top: 10px;
-            font-size: 0.9rem;
-        }
-        
-        .dashboard {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
-            gap: 20px;
-            margin-bottom: 20px;
-        }
-        
-        .card {
-            background: white;
-            border-radius: 10px;
-            padding: 20px;
-            box-shadow: 0 4px 15px rgba(0, 0, 0, 0.05);
-            transition: transform 0.3s ease;
-        }
-        
-        .card:hover {
-            transform: translateY(-5px);
-        }
-        
-        .card-header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-bottom: 15px;
-            padding-bottom: 10px;
-            border-bottom: 1px solid #eee;
-        }
-        
-        .card-title {
-            font-size: 1.2rem;
-            font-weight: 600;
-            color: var(--primary);
-        }
-        
-        .motor-status {
-            display: inline-block;
-            padding: 3px 8px;
-            border-radius: 20px;
-            font-size: 0.8rem;
-            font-weight: 500;
-        }
-        
-        .status-active {
-            background-color: rgba(46, 204, 113, 0.2);
-            color: var(--success);
-        }
-        
-        .status-inactive {
-            background-color: rgba(236, 240, 241, 0.8);
-            color: var(--dark);
-        }
-        
-        .status-calibrating {
-            background-color: rgba(243, 156, 18, 0.2);
-            color: var(--warning);
-        }
-        
-        .control-group {
-            margin-bottom: 15px;
-        }
-        
-        .control-label {
-            display: block;
-            margin-bottom: 5px;
-            font-weight: 500;
-        }
-        
-        .value-display {
-            font-size: 1.5rem;
-            font-weight: 700;
-            color: var(--secondary);
-            text-align: center;
-            margin: 10px 0;
-        }
-        
-        .slider-container {
-            display: flex;
-            align-items: center;
-            gap: 10px;
-        }
-        
-        .slider {
-            flex: 1;
-            -webkit-appearance: none;
-            height: 8px;
-            border-radius: 4px;
-            background: #ddd;
-            outline: none;
-        }
-        
-        .slider::-webkit-slider-thumb {
-            -webkit-appearance: none;
-            width: 20px;
-            height: 20px;
-            border-radius: 50%;
-            background: var(--secondary);
-            cursor: pointer;
-            transition: background 0.3s;
-        }
-        
-        .slider::-webkit-slider-thumb:hover {
-            background: var(--primary);
-        }
-        
-        .btn {
-            padding: 10px 15px;
-            border: none;
-            border-radius: 5px;
-            cursor: pointer;
-            font-weight: 500;
-            transition: all 0.3s ease;
-        }
-        
-        .btn-primary {
-            background-color: var(--secondary);
-            color: white;
-        }
-        
-        .btn-primary:hover {
-            background-color: var(--primary);
-        }
-        
-        .btn-success {
-            background-color: var(--success);
-            color: white;
-        }
-        
-        .btn-success:hover {
-            background-color: #27ae60;
-        }
-        
-        .btn-warning {
-            background-color: var(--warning);
-            color: white;
-        }
-        
-        .btn-warning:hover {
-            background-color: #e67e22;
-        }
-        
-        .btn-danger {
-            background-color: var(--accent);
-            color: white;
-        }
-        
-        .btn-danger:hover {
-            background-color: #c0392b;
-        }
-        
-        .btn-active {
-            background-color: var(--primary);
-            color: white;
-            box-shadow: 0 0 10px rgba(0,0,0,0.2);
-        }
-        
-        .btn-group {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 10px;
-            margin-top: 15px;
-        }
-        
-        .servo-control {
-            text-align: center;
-            margin-top: 20px;
-        }
-        
-        .switch {
-            position: relative;
-            display: inline-block;
-            width: 60px;
-            height: 30px;
-        }
-        
-        .switch input {
-            opacity: 0;
-            width: 0;
-            height: 0;
-        }
-        
-        .slider-switch {
-            position: absolute;
-            cursor: pointer;
-            top: 0;
-            left: 0;
-            right: 0;
-            bottom: 0;
-            background-color: #ccc;
-            transition: .4s;
-            border-radius: 30px;
-        }
-        
-        .slider-switch:before {
-            position: absolute;
-            content: "";
-            height: 22px;
-            width: 22px;
-            left: 4px;
-            bottom: 4px;
-            background-color: white;
-            transition: .4s;
-            border-radius: 50%;
-        }
-        
-        input:checked + .slider-switch {
-            background-color: var(--success);
-        }
-        
-        input:checked + .slider-switch:before {
-            transform: translateX(30px);
-        }
-        
-        .notification {
-            position: fixed;
-            bottom: 20px;
-            right: 20px;
-            padding: 15px 20px;
-            border-radius: 5px;
-            color: white;
-            opacity: 0;
-            transform: translateY(20px);
-            transition: all 0.3s ease;
-            z-index: 1000;
-            box-shadow: 0 4px 15px rgba(0, 0, 0, 0.1);
-        }
-        
-        .notification.show {
-            opacity: 1;
-            transform: translateY(0);
-        }
-        
-        .notification-success {
-            background-color: var(--success);
-        }
-        
-        .notification-warning {
-            background-color: var(--warning);
-        }
-        
-        .notification-info {
-            background-color: var(--secondary);
-        }
-        
-        @media (max-width: 768px) {
-            .dashboard {
-                grid-template-columns: 1fr;
-            }
-        }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <header>
-            <h1>Керування двигунами ESP32</h1>
-            <p>Інтерфейс для контролю 4 двигунів та сервоприводу</p>
-            <div class="status-bar">
-                <span>Статус: <span id="global-status">ПІДКЛЮЧЕНО</span></span>
-            </div>
-        </header>
-        
-        <div class="dashboard">
-            <!-- Двигун 1 -->
-            <div class="card">
-                <div class="card-header">
-                    <span class="card-title">Двигун 1 (Піни: 13,12)</span>
-                    <span class="motor-status status-inactive">Неактивний</span>
-                </div>
-                <div class="control-group">
-                    <label class="control-label">Поточна позиція (мм)</label>
-                    <div class="value-display" id="motor0-position">0</div>
-                </div>
-                <div class="control-group">
-                    <label class="control-label">Цільова позиція (мм)</label>
-                    <div class="slider-container">
-                        <input type="range" min="0" max="20" value="0" class="slider" id="motor0-target">
-                        <span id="motor0-target-value">0</span>
-                    </div>
-                </div>
-                <div class="btn-group">
-                    <button class="btn btn-primary" id="motor0-set">Встановити</button>
-                    <button class="btn btn-success" id="motor0-calibrate">Калібрувати</button>
-                </div>
-                <div class="btn-group">
-                    <button class="btn btn-warning motor-full-forward" data-motor="0">Повний вперед</button>
-                    <button class="btn btn-warning motor-full-backward" data-motor="0">Повний назад</button>
-                </div>
-            </div>
-            
-            <!-- Двигун 2 -->
-            <div class="card">
-                <div class="card-header">
-                    <span class="card-title">Двигун 2 (Піни: 27,26)</span>
-                    <span class="motor-status status-inactive">Неактивний</span>
-                </div>
-                <div class="control-group">
-                    <label class="control-label">Поточна позиція (мм)</label>
-                    <div class="value-display" id="motor1-position">0</div>
-                </div>
-                <div class="control-group">
-                    <label class="control-label">Цільова позиція (мм)</label>
-                    <div class="slider-container">
-                        <input type="range" min="0" max="20" value="0" class="slider" id="motor1-target">
-                        <span id="motor1-target-value">0</span>
-                    </div>
-                </div>
-                <div class="btn-group">
-                    <button class="btn btn-primary" id="motor1-set">Встановити</button>
-                    <button class="btn btn-success" id="motor1-calibrate">Калібрувати</button>
-                </div>
-                <div class="btn-group">
-                    <button class="btn btn-warning motor-full-forward" data-motor="1">Повний вперед</button>
-                    <button class="btn btn-warning motor-full-backward" data-motor="1">Повний назад</button>
-                </div>
-            </div>
-            
-            <!-- Двигун 3 -->
-            <div class="card">
-                <div class="card-header">
-                    <span class="card-title">Двигун 3 (Піни: 14,16)</span>
-                    <span class="motor-status status-inactive">Неактивний</span>
-                </div>
-                <div class="control-group">
-                    <label class="control-label">Поточна позиція (мм)</label>
-                    <div class="value-display" id="motor2-position">0</div>
-                </div>
-                <div class="control-group">
-                    <label class="control-label">Цільова позиція (мм)</label>
-                    <div class="slider-container">
-                        <input type="range" min="0" max="20" value="0" class="slider" id="motor2-target">
-                        <span id="motor2-target-value">0</span>
-                    </div>
-                </div>
-                <div class="btn-group">
-                    <button class="btn btn-primary" id="motor2-set">Встановити</button>
-                    <button class="btn btn-success" id="motor2-calibrate">Калібрувати</button>
-                </div>
-                <div class="btn-group">
-                    <button class="btn btn-warning motor-full-forward" data-motor="2">Повний вперед</button>
-                    <button class="btn btn-warning motor-full-backward" data-motor="2">Повний назад</button>
-                </div>
-            </div>
-            
-            <!-- Двигун 4 -->
-            <div class="card">
-                <div class="card-header">
-                    <span class="card-title">Двигун 4 (Піни: 2,15)</span>
-                    <span class="motor-status status-inactive">Неактивний</span>
-                </div>
-                <div class="control-group">
-                    <label class="control-label">Поточна позиція (мм)</label>
-                    <div class="value-display" id="motor3-position">0</div>
-                </div>
-                <div class="control-group">
-                    <label class="control-label">Цільова позиція (мм)</label>
-                    <div class="slider-container">
-                        <input type="range" min="0" max="20" value="0" class="slider" id="motor3-target">
-                        <span id="motor3-target-value">0</span>
-                    </div>
-                </div>
-                <div class="btn-group">
-                    <button class="btn btn-primary" id="motor3-set">Встановити</button>
-                    <button class="btn btn-success" id="motor3-calibrate">Калібрувати</button>
-                </div>
-                <div class="btn-group">
-                    <button class="btn btn-warning motor-full-forward" data-motor="3">Повний вперед</button>
-                    <button class="btn btn-warning motor-full-backward" data-motor="3">Повний назад</button>
-                </div>
-            </div>
-            
-            <!-- Сервопривід -->
-            <div class="card">
-                <div class="card-header">
-                    <span class="card-title">Сервопривід (Піни: 18,19)</span>
-                    <span class="motor-status status-inactive">Вимкнено</span>
-                </div>
-                <div class="servo-control">
-                    <label class="switch">
-                        <input type="checkbox" id="servo-toggle">
-                        <span class="slider-switch"></span>
-                    </label>
-                    <p style="margin-top: 10px;">Стан: <span id="servo-state">ВИМКНЕНО</span></p>
-                </div>
-            </div>
-            
-            <!-- Группове управління -->
-            <div class="card">
-                <div class="card-header">
-                    <span class="card-title">Группове управління</span>
-                </div>
-                <div class="control-group">
-                    <label class="control-label">Цільова позиція для всіх двигунів (мм)</label>
-                    <div class="slider-container">
-                        <input type="range" min="0" max="20" value="0" class="slider" id="all-motors-target">
-                        <span id="all-motors-target-value">0</span>
-                    </div>
-                </div>
-                <div class="btn-group" style="grid-template-columns: 1fr;">
-                    <button class="btn btn-primary" id="all-motors-set">Встановити для всіх</button>
-                    <button class="btn btn-success" id="all-motors-calibrate">Калібрувати всі</button>
-                    <button class="btn btn-warning" id="all-full-forward">Всі повний вперед</button>
-                    <button class="btn btn-warning" id="all-full-backward">Всі повний назад</button>
-                    <button class="btn btn-danger" id="emergency-stop">Аварійна зупинка</button>
-                </div>
-            </div>
-        </div>
-    </div>
-    
-    <div class="notification" id="notification">
-        Повідомлення
-    </div>
+// Encoder variables
+volatile int8_t encoder_delta = 0;
+unsigned long lastEncoderUpdate = 0;
+unsigned long lastDebounce = 0;
+bool btnPressed = false;
 
-    <script>
-        document.addEventListener('DOMContentLoaded', function() {
-            let websocket;
-            let allForwardActive = false;
-            let allBackwardActive = false;
-            
-            // Підключення WebSocket
-            function connectWebSocket() {
-                const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-                const wsUrl = `${protocol}//${window.location.hostname}:81`;
-                websocket = new WebSocket(wsUrl);
-                
-                websocket.onopen = function(event) {
-                    console.log('WebSocket connected');
-                    showNotification('Підключено до ESP32', 'success');
-                };
-                
-                websocket.onclose = function(event) {
-                    console.log('WebSocket disconnected');
-                    showNotification('Відключено від ESP32', 'warning');
-                    setTimeout(connectWebSocket, 3000);
-                };
-                
-                websocket.onerror = function(error) {
-                    console.error('WebSocket error:', error);
-                };
-                
-                websocket.onmessage = function(event) {
-                    const data = JSON.parse(event.data);
-                    updateInterface(data);
-                };
-            }
-            
-            // Ініціалізація слайдерів для кожного двигуна (0-3)
-            for (let i = 0; i <= 3; i++) {
-                const slider = document.getElementById(`motor${i}-target`);
-                const valueDisplay = document.getElementById(`motor${i}-target-value`);
-                
-                slider.addEventListener('input', function() {
-                    valueDisplay.textContent = this.value;
-                });
-                
-                // Кнопка встановлення цілі
-                document.getElementById(`motor${i}-set`).addEventListener('click', function() {
-                    setMotorTarget(i, parseInt(slider.value));
-                });
-                
-                // Кнопка калібрування
-                document.getElementById(`motor${i}-calibrate`).addEventListener('click', function() {
-                    calibrateMotor(i);
-                });
-            }
-            
-            // Кнопки повного вперед і назад для кожного двигуна
-            document.querySelectorAll('.motor-full-forward').forEach(button => {
-                button.addEventListener('click', function() {
-                    const motorId = this.getAttribute('data-motor');
-                    sendCommand('full_forward', { motor: parseInt(motorId) });
-                });
-            });
-            
-            document.querySelectorAll('.motor-full-backward').forEach(button => {
-                button.addEventListener('click', function() {
-                    const motorId = this.getAttribute('data-motor');
-                    sendCommand('full_backward', { motor: parseInt(motorId) });
-                });
-            });
-            
-            // Группове управління
-            const allMotorsSlider = document.getElementById('all-motors-target');
-            const allMotorsValue = document.getElementById('all-motors-target-value');
-            
-            allMotorsSlider.addEventListener('input', function() {
-                allMotorsValue.textContent = this.value;
-            });
-            
-            document.getElementById('all-motors-set').addEventListener('click', function() {
-                const target = parseInt(allMotorsSlider.value);
-                sendCommand('set_all_targets', { target: target });
-            });
-            
-            document.getElementById('all-motors-calibrate').addEventListener('click', function() {
-                sendCommand('calibrate_all', {});
-            });
-            
-            document.getElementById('all-full-forward').addEventListener('click', function() {
-                sendCommand('all_full_forward', {});
-            });
-            
-            document.getElementById('all-full-backward').addEventListener('click', function() {
-                sendCommand('all_full_backward', {});
-            });
-            
-            document.getElementById('emergency-stop').addEventListener('click', function() {
-                sendCommand('emergency_stop', {});
-            });
-            
-            // Керування сервоприводом
-            document.getElementById('servo-toggle').addEventListener('change', function() {
-                sendCommand('set_servo', { state: this.checked });
-            });
-            
-            // Функції управління
-            function setMotorTarget(motorId, target) {
-                sendCommand('set_target', { motor: motorId, target: target });
-            }
-            
-            function calibrateMotor(motorId) {
-                sendCommand('calibrate', { motor: motorId });
-            }
-            
-            function sendCommand(type, data) {
-                if (websocket && websocket.readyState === WebSocket.OPEN) {
-                    const command = {
-                        type: type,
-                        data: data
-                    };
-                    websocket.send(JSON.stringify(command));
-                    console.log('Sent command:', command);
-                } else {
-                    showNotification('Немає з\'єднання з ESP32', 'warning');
-                }
-            }
-            
-            function updateInterface(data) {
-                // Оновлення значень двигунів (0-3)
-                for (let i = 0; i <= 3; i++) {
-                    const motorData = data[`motor${i}`];
-                    if (motorData) {
-                        document.getElementById(`motor${i}-position`).textContent = motorData.position;
-                        document.getElementById(`motor${i}-target-value`).textContent = motorData.target;
-                        document.getElementById(`motor${i}-target`).value = motorData.target;
-                        
-                        // Оновлення статусу
-                        const statusElement = document.querySelector(`#motor${i} .motor-status`);
-                        if (motorData.running) {
-                            statusElement.textContent = 'Активний';
-                            statusElement.className = 'motor-status status-active';
-                        } else if (motorData.calibrating) {
-                            statusElement.textContent = 'Калібрування';
-                            statusElement.className = 'motor-status status-calibrating';
-                        } else {
-                            statusElement.textContent = 'Неактивний';
-                            statusElement.className = 'motor-status status-inactive';
-                        }
-                        
-                        // Оновлення стану кнопок повного ходу
-                        const forwardBtn = document.querySelector(`.motor-full-forward[data-motor="${i}"]`);
-                        const backwardBtn = document.querySelector(`.motor-full-backward[data-motor="${i}"]`);
-                        
-                        if (motorData.fullForward) {
-                            forwardBtn.classList.add('btn-active');
-                        } else {
-                            forwardBtn.classList.remove('btn-active');
-                        }
-                        
-                        if (motorData.fullBackward) {
-                            backwardBtn.classList.add('btn-active');
-                        } else {
-                            backwardBtn.classList.remove('btn-active');
-                        }
-                    }
-                }
-                
-                // Оновлення сервоприводу
-                if (data.servoState !== undefined) {
-                    const servoState = data.servoState;
-                    document.getElementById('servo-state').textContent = servoState ? 'УВІМКНЕНО' : 'ВИМКНЕНО';
-                    document.getElementById('servo-toggle').checked = servoState;
-                    
-                    const statusElement = document.querySelector('.card:nth-last-child(2) .motor-status');
-                    statusElement.textContent = servoState ? 'Активний' : 'Вимкнено';
-                    statusElement.className = 'motor-status ' + (servoState ? 'status-active' : 'status-inactive');
-                }
-                
-                // Оновлення глобального статусу
-                if (data.globalStatus) {
-                    document.getElementById('global-status').textContent = data.globalStatus;
-                }
-                
-                // Оновлення кнопок групового управління
-                const allForwardBtn = document.getElementById('all-full-forward');
-                const allBackwardBtn = document.getElementById('all-full-backward');
-                
-                // Перевірка стану всіх двигунів для групових кнопок
-                let allForward = true;
-                let allBackward = true;
-                
-                for (let i = 0; i <= 3; i++) {
-                    const motorData = data[`motor${i}`];
-                    if (motorData) {
-                        if (!motorData.fullForward) allForward = false;
-                        if (!motorData.fullBackward) allBackward = false;
-                    }
-                }
-                
-                if (allForward) {
-                    allForwardBtn.classList.add('btn-active');
-                } else {
-                    allForwardBtn.classList.remove('btn-active');
-                }
-                
-                if (allBackward) {
-                    allBackwardBtn.classList.add('btn-active');
-                } else {
-                    allBackwardBtn.classList.remove('btn-active');
-                }
-            }
-            
-            function showNotification(message, type) {
-                const notification = document.getElementById('notification');
-                notification.textContent = message;
-                notification.className = 'notification';
-                
-                switch (type) {
-                    case 'success':
-                        notification.classList.add('notification-success');
-                        break;
-                    case 'warning':
-                        notification.classList.add('notification-warning');
-                        break;
-                    case 'info':
-                        notification.classList.add('notification-info');
-                        break;
-                }
-                
-                notification.classList.add('show');
-                
-                setTimeout(() => {
-                    notification.classList.remove('show');
-                }, 3000);
-            }
-            
-            // Почати підключення WebSocket
-            connectWebSocket();
-        });
-    </script>
-</body>
-</html>
-)rawliteral";
+// Display timer
+unsigned long displayStartTime = 0;
+bool showIP = true;
+
+// WiFi Manager instance
+WiFiManager wm;
 
 // Function prototypes
 void setServoState(bool state);
 void setMotorTarget(int motor, int target);
 void drawMenu();
+void drawIPDisplay();
 void sendState();
 void toggleCalibration(int motor);
 void startMotor(int motor, int dir);
@@ -826,13 +91,15 @@ void toggleFullForward(int motor);
 void toggleFullBackward(int motor);
 void toggleAllFullForward();
 void toggleAllFullBackward();
-void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length);
+void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType type, void *arg, uint8_t *data, size_t len);
 void IRAM_ATTR readEncoder();
 void setupI2C();
+void setupOTA();
+void handleWebServer();
 
 // ==== I2C ====
 void setupI2C() {
-  Wire.begin(21, 22);
+  Wire.begin(21, 22); // SDA, SCL
   Wire.setClock(400000);
 }
 
@@ -841,10 +108,10 @@ void setServoState(bool state) {
   servoState = state;
   if (servoState) {
     if (!myServo1.attached()) {
-      myServo1.attach(servoPin1, 500, 2400);
+      myServo1.attach(servoPins[0], 500, 2400);
     }
     if (!myServo2.attached()) {
-      myServo2.attach(servoPin2, 500, 2400);
+      myServo2.attach(servoPins[1], 500, 2400);
     }
     myServo1.write(180);
     myServo2.write(180);
@@ -855,7 +122,33 @@ void setServoState(bool state) {
   sendState();
 }
 
-// ==== OLED ====
+// ==== OLED Display ====
+void drawIPDisplay() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  
+  display.setCursor(0, 0);
+  display.println("ESP32 IP:");
+  display.println("");
+  
+  display.setTextSize(2);
+  if (WiFi.status() == WL_CONNECTED) {
+    display.println(WiFi.localIP().toString());
+    display.setTextSize(1);
+    display.println("");
+    display.println("Connected!");
+    display.println("OTA Ready");
+  } else {
+    display.println("No WiFi");
+    display.setTextSize(1);
+    display.println("");
+    display.println("AP Mode");
+  }
+  
+  display.display();
+}
+
 void drawMenu() {
   display.clearDisplay();
   display.setTextSize(1);
@@ -865,27 +158,11 @@ void drawMenu() {
   display.drawRect(0, 0, SCREEN_WIDTH, 14, SSD1306_WHITE);
   display.setCursor(4, 4);
   
-  if (menu_level == 0) {
-    display.print("MAIN MENU");
-  }
-  else if (menu_level == 1) {
-    display.print("MOTOR CONTROL TYPE");
-  }
-  else if (menu_level == 2) {
-    display.print("MOTOR SELECT");
-  }
-  else if (menu_level == 3) {
-    display.print("ACTION SELECT");
-  }
-  else if (menu_level == 4) {
-    display.print("DISTANCE CONTROL");
-  }
-  else if (menu_level == 5) {
-    display.print("CALIBRATION");
-  }
-  else if (menu_level == 6) {
-    display.print("SERVO CONTROL");
-  }
+  const char* headers[] = {
+    "MAIN MENU", "MOTOR CONTROL TYPE", "MOTOR SELECT", 
+    "ACTION SELECT", "DISTANCE CONTROL", "CALIBRATION", "SERVO CONTROL"
+  };
+  display.print(headers[menu_level]);
 
   // Display menu items
   display.setCursor(0, 16);
@@ -1068,7 +345,7 @@ void IRAM_ATTR readEncoder() {
   if (interruptTime - lastInterruptTime < 5) return;
   lastInterruptTime = interruptTime;
   
-  uint8_t state = (digitalRead(ENCODER_A) << 1) | digitalRead(ENCODER_B);
+  uint8_t state = (digitalRead(encoderPins[0]) << 1) | digitalRead(encoderPins[1]);
   uint8_t transition = (lastState << 2) | state;
 
   if (transition == 0b1101 || transition == 0b0100 || transition == 0b0010 || transition == 0b1011) encoder_delta++;
@@ -1085,24 +362,8 @@ void startMotor(int motor, int dir) {
   motors[motor].dir = dir;
   motors[motor].move_start_time = millis();
   
-  switch(motor) {
-    case 0: // Двигун 0
-      digitalWrite(IN1_M1, dir > 0 ? HIGH : LOW);
-      digitalWrite(IN2_M1, dir < 0 ? HIGH : LOW);
-      break;
-    case 1: // Двигун 1
-      digitalWrite(IN1_M2, dir > 0 ? HIGH : LOW);
-      digitalWrite(IN2_M2, dir < 0 ? HIGH : LOW);
-      break;
-    case 2: // Двигун 2
-      digitalWrite(IN1_M3, dir > 0 ? HIGH : LOW);
-      digitalWrite(IN2_M3, dir < 0 ? HIGH : LOW);
-      break;
-    case 3: // Двигун 3
-      digitalWrite(IN1_M4, dir > 0 ? HIGH : LOW);
-      digitalWrite(IN2_M4, dir < 0 ? HIGH : LOW);
-      break;
-  }
+  digitalWrite(motorPins[motor][0], dir > 0 ? HIGH : LOW);
+  digitalWrite(motorPins[motor][1], dir < 0 ? HIGH : LOW);
 }
 
 void stopMotor(int motor) {
@@ -1113,24 +374,8 @@ void stopMotor(int motor) {
   motors[motor].fullBackward = false;
   motors[motor].calibrating = false;
   
-  switch(motor) {
-    case 0: // Двигун 0
-      digitalWrite(IN1_M1, LOW);
-      digitalWrite(IN2_M1, LOW);
-      break;
-    case 1: // Двигун 1
-      digitalWrite(IN1_M2, LOW);
-      digitalWrite(IN2_M2, LOW);
-      break;
-    case 2: // Двигун 2
-      digitalWrite(IN1_M3, LOW);
-      digitalWrite(IN2_M3, LOW);
-      break;
-    case 3: // Двигун 3
-      digitalWrite(IN1_M4, LOW);
-      digitalWrite(IN2_M4, LOW);
-      break;
-  }
+  digitalWrite(motorPins[motor][0], LOW);
+  digitalWrite(motorPins[motor][1], LOW);
   
   sendState();
   drawMenu();
@@ -1220,20 +465,25 @@ void toggleCalibration(int motor) {
 }
 
 // WebSocket event handler
-void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length) {
+void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType type, void *arg, uint8_t *data, size_t len) {
   switch(type) {
-    case WStype_DISCONNECTED:
-      Serial.printf("[%u] Disconnected!\n", num);
+    case WS_EVT_CONNECT:
+      Serial.printf("WebSocket client #%u connected from %s\n", client->id(), client->remoteIP().toString().c_str());
+      sendState(); // Send initial state to new client
       break;
-    case WStype_CONNECTED: {
-        IPAddress ip = webSocket.remoteIP(num);
-        Serial.printf("[%u] Connected from %d.%d.%d.%d url: %s\n", num, ip[0], ip[1], ip[2], ip[3], payload);
-      }
+      
+    case WS_EVT_DISCONNECT:
+      Serial.printf("WebSocket client #%u disconnected\n", client->id());
       break;
-    case WStype_TEXT: {
-        Serial.printf("[%u] get Text: %s\n", num, payload);
+      
+    case WS_EVT_DATA: {
+      AwsFrameInfo *info = (AwsFrameInfo*)arg;
+      if (info->final && info->index == 0 && info->len == len && info->opcode == WS_TEXT) {
+        data[len] = 0;
+        Serial.printf("WebSocket message: %s\n", data);
+        
         JsonDocument doc;
-        DeserializationError error = deserializeJson(doc, payload);
+        DeserializationError error = deserializeJson(doc, data);
         
         if (error) {
           Serial.print(F("deserializeJson() failed: "));
@@ -1242,19 +492,19 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length
         }
         
         const char* commandType = doc["type"];
-        JsonObject data = doc["data"];
+        JsonObject dataObj = doc["data"];
         
         if (strcmp(commandType, "set_target") == 0) {
-          int motor = data["motor"];
-          int target = data["target"];
+          int motor = dataObj["motor"];
+          int target = dataObj["target"];
           setMotorTarget(motor, target);
         }
         else if (strcmp(commandType, "calibrate") == 0) {
-          int motor = data["motor"];
+          int motor = dataObj["motor"];
           toggleCalibration(motor);
         }
         else if (strcmp(commandType, "set_all_targets") == 0) {
-          int target = data["target"];
+          int target = dataObj["target"];
           for (int i = 0; i < 4; i++) {
             setMotorTarget(i, target);
           }
@@ -1268,15 +518,15 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length
           stopAllMotors();
         }
         else if (strcmp(commandType, "set_servo") == 0) {
-          bool state = data["state"];
+          bool state = dataObj["state"];
           setServoState(state);
         }
         else if (strcmp(commandType, "full_forward") == 0) {
-          int motor = data["motor"];
+          int motor = dataObj["motor"];
           toggleFullForward(motor);
         }
         else if (strcmp(commandType, "full_backward") == 0) {
-          int motor = data["motor"];
+          int motor = dataObj["motor"];
           toggleFullBackward(motor);
         }
         else if (strcmp(commandType, "all_full_forward") == 0) {
@@ -1285,22 +535,30 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length
         else if (strcmp(commandType, "all_full_backward") == 0) {
           toggleAllFullBackward();
         }
+        else if (strcmp(commandType, "get_ip") == 0) {
+          sendState(); // Will include IP address
+        }
       }
+      break;
+    }
+      
+    case WS_EVT_ERROR:
+      Serial.printf("WebSocket error\n");
       break;
   }
 }
 
-// Виправлена функція для відправки стану через WebSocket
+// Send state to all WebSocket clients
 void sendState() {
   JsonDocument doc;
   
-  // Відправляємо дані для кожного двигуна (0-3)
+  // Send data for each motor (0-3)
   for (int i = 0; i < 4; i++) {
     char motorKey[10];
-    sprintf(motorKey, "motor%d", i); // motor0, motor1, motor2, motor3
+    sprintf(motorKey, "motor%d", i);
     
     JsonObject motorData = doc[motorKey].to<JsonObject>();
-    motorData["position"] = motors[i].real_position;  // Використовуємо real_position
+    motorData["position"] = motors[i].real_position;
     motorData["target"] = motors[i].target;
     motorData["running"] = motors[i].running;
     motorData["calibrating"] = motors[i].calibrating;
@@ -1309,6 +567,7 @@ void sendState() {
   }
   
   doc["servoState"] = servoState;
+  doc["ip"] = WiFi.localIP().toString();
   
   bool any_running = false;
   for (int i = 0; i < 4; i++) {
@@ -1321,7 +580,7 @@ void sendState() {
   
   String output;
   serializeJson(doc, output);
-  webSocket.broadcastTXT(output);
+  ws.textAll(output);
 }
 
 void setMotorTarget(int motor, int target) {
@@ -1342,282 +601,385 @@ void setMotorTarget(int motor, int target) {
   sendState();
 }
 
+void setupOTA() {
+  // Port defaults to 3232
+  // ArduinoOTA.setPort(3232);
+
+  // Hostname defaults to esp32-[MAC]
+  ArduinoOTA.setHostname("esp32-stanok");
+
+  // No authentication by default
+  ArduinoOTA.setPassword("ota123");
+
+  // Password can be set with it's md5 value as well
+  // MD5(admin) = 21232f297a57a5a743894a0e4a801fc3
+  // ArduinoOTA.setPasswordHash("21232f297a57a5a743894a0e4a801fc3");
+
+  ArduinoOTA
+    .onStart([]() {
+      String type;
+      if (ArduinoOTA.getCommand() == U_FLASH)
+        type = "sketch";
+      else // U_SPIFFS
+        type = "filesystem";
+
+      // NOTE: if updating SPIFFS this would be the place to unmount SPIFFS using SPIFFS.end()
+      Serial.println("Start updating " + type);
+      
+      // Stop all motors for safety
+      stopAllMotors();
+      
+      // Clear OLED and show updating message
+      display.clearDisplay();
+      display.setTextSize(1);
+      display.setTextColor(SSD1306_WHITE);
+      display.setCursor(0, 0);
+      display.println("OTA UPDATE");
+      display.println("Updating " + type);
+      display.display();
+    })
+    .onEnd([]() {
+      Serial.println("\nEnd");
+      display.clearDisplay();
+      display.setTextSize(1);
+      display.setTextColor(SSD1306_WHITE);
+      display.setCursor(0, 0);
+      display.println("Update Complete!");
+      display.println("Rebooting...");
+      display.display();
+    })
+    .onProgress([](unsigned int progress, unsigned int total) {
+      Serial.printf("Progress: %u%%\r", (progress / (total / 100)));
+      
+      // Show progress on OLED
+      display.clearDisplay();
+      display.setTextSize(1);
+      display.setTextColor(SSD1306_WHITE);
+      display.setCursor(0, 0);
+      display.println("OTA UPDATE");
+      display.printf("Progress: %u%%", (progress / (total / 100)));
+      display.display();
+    })
+    .onError([](ota_error_t error) {
+      Serial.printf("Error[%u]: ", error);
+      if (error == OTA_AUTH_ERROR) Serial.println("Auth Failed");
+      else if (error == OTA_BEGIN_ERROR) Serial.println("Begin Failed");
+      else if (error == OTA_CONNECT_ERROR) Serial.println("Connect Failed");
+      else if (error == OTA_RECEIVE_ERROR) Serial.println("Receive Failed");
+      else if (error == OTA_END_ERROR) Serial.println("End Failed");
+      
+      // Show error on OLED
+      display.clearDisplay();
+      display.setTextSize(1);
+      display.setTextColor(SSD1306_WHITE);
+      display.setCursor(0, 0);
+      display.println("OTA ERROR!");
+      display.printf("Error: %u", error);
+      display.display();
+    });
+
+  ArduinoOTA.begin();
+  Serial.println("OTA Ready");
+  Serial.print("IP address: ");
+  Serial.println(WiFi.localIP());
+  Serial.println("Use your OTA tool to upload");
+}
+
+void handleWebServer() {
+  // Setup WebSocket
+  ws.onEvent(onWsEvent);
+  server.addHandler(&ws);
+
+  // Serve static files from LittleFS
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
+    request->send(LittleFS, "/index.html", "text/html");
+  });
+  
+  server.on("/style.css", HTTP_GET, [](AsyncWebServerRequest *request) {
+    request->send(LittleFS, "/style.css", "text/css");
+  });
+  
+  server.on("/script.js", HTTP_GET, [](AsyncWebServerRequest *request) {
+    request->send(LittleFS, "/script.js", "application/javascript");
+  });
+
+  // Start server
+  server.begin();
+  Serial.println("HTTP server started");
+}
+
 void setup() {
   Serial.begin(115200);
+  Serial.println("\n\nBooting...");
   setupI2C();
 
+  // Initialize OLED
   if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
     Serial.println("OLED init failed");
     for (;;);
   }
 
-  pinMode(ENCODER_A, INPUT_PULLUP);
-  pinMode(ENCODER_B, INPUT_PULLUP);
-  pinMode(ENCODER_BTN, INPUT_PULLUP);
-  attachInterrupt(digitalPinToInterrupt(ENCODER_A), readEncoder, CHANGE);
-  attachInterrupt(digitalPinToInterrupt(ENCODER_B), readEncoder, CHANGE);
-
-  // Ініціалізація пінів двигунів
-  pinMode(IN1_M1, OUTPUT);
-  pinMode(IN2_M1, OUTPUT);
-  pinMode(IN1_M2, OUTPUT);
-  pinMode(IN2_M2, OUTPUT);
-  pinMode(IN1_M3, OUTPUT);
-  pinMode(IN2_M3, OUTPUT);
-  pinMode(IN1_M4, OUTPUT);
-  pinMode(IN2_M4, OUTPUT);
-  
-  // Ініціалізація кінцевиків
-  pinMode(LIMIT_SWITCH_M1, INPUT_PULLUP);
-  pinMode(LIMIT_SWITCH_M2, INPUT_PULLUP);
-  pinMode(LIMIT_SWITCH_M3, INPUT_PULLUP);
-  pinMode(LIMIT_SWITCH_M4, INPUT_PULLUP);
-  
-  // Гарантоване вимикання всіх двигунів при старті
-  stopAllMotors();
-  
-  // Додаткова затримка для стабілізації
-  delay(100);
-  
-  setServoState(false);
-
-  // Ініціалізація SPIFFS
-  if (!SPIFFS.begin(true)) {
-    Serial.println("An error has occurred while mounting SPIFFS");
-    return;
+  // Initialize encoder
+  for (int i = 0; i < 3; i++) {
+    pinMode(encoderPins[i], INPUT_PULLUP);
   }
+  attachInterrupt(digitalPinToInterrupt(encoderPins[0]), readEncoder, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(encoderPins[1]), readEncoder, CHANGE);
 
-  // Створення точки доступу
-  WiFi.mode(WIFI_AP);
-  WiFi.softAP(ssid, password);
+  // Initialize motor pins
+  for (int i = 0; i < 4; i++) {
+    for (int j = 0; j < 2; j++) {
+      pinMode(motorPins[i][j], OUTPUT);
+      digitalWrite(motorPins[i][j], LOW);
+    }
+  }
   
-  IPAddress IP = WiFi.softAPIP();
-  Serial.print("AP IP address: ");
-  Serial.println(IP);
-
-  // Налаштування веб-сервера
-  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
-    request->send(200, "text/html", html_content);
-  });
-
-  // Запуск сервера
-  server.begin();
+  // Initialize limit switches
+  for (int i = 0; i < 4; i++) {
+    pinMode(limitPins[i], INPUT_PULLUP);
+  }
   
-  // Запуск WebSocket
-  webSocket.begin();
-  webSocket.onEvent(webSocketEvent);
+  // Initialize LittleFS
+  if (!LittleFS.begin()) {
+    Serial.println("LittleFS mount failed");
+    // Format LittleFS if mount fails
+    Serial.println("Formatting LittleFS...");
+    LittleFS.format();
+    if (!LittleFS.begin()) {
+      Serial.println("LittleFS mount failed after formatting");
+    }
+  }
+  Serial.println("LittleFS mounted successfully");
 
-  drawMenu();
+  // Initialize WiFiManager
+  wm.setConfigPortalTimeout(180); // 3 minutes timeout
+  
+  // Reset settings - wipe stored credentials for testing
+  // wm.resetSettings();
+  
+  // Set custom hostname for mDNS
+  wm.setHostname("esp32-stanok");
+  
+  // Automatically connect using saved credentials,
+  // if connection fails, it starts an access point with the specified name
+  bool res = wm.autoConnect("ESP32-Config", "config123");
+  
+  if (!res) {
+    Serial.println("Failed to connect or configure");
+    ESP.restart();
+  }
+  
+  Serial.println("WiFi connected!");
+  Serial.print("IP address: ");
+  Serial.println(WiFi.localIP());
+  Serial.print("Hostname: ");
+  Serial.println(WiFi.getHostname());
+
+  // Show IP on OLED for 10 seconds
+  displayStartTime = millis();
+  drawIPDisplay();
+
+  // Setup OTA FIRST
+  setupOTA();
+  
+  // Then setup Web Server
+  handleWebServer();
+
+  // Initialize servos
+  setServoState(false);
+  
+  Serial.println("Setup complete!");
 }
 
 void loop() {
-  webSocket.loop();
+  ArduinoOTA.handle();
   
-  // Handle scrolling
-  if (encoder_delta != 0) {
-    if (millis() - lastEncoderUpdate > ENCODER_DEBOUNCE) {
-      lastEncoderUpdate = millis();
-      
-      int8_t delta = (encoder_delta > 0) ? 1 : -1;
-      
-      if (menu_level == 4 && edit_value) {
-        motors[selected_motor].target += delta;
-        if (motors[selected_motor].target < min_mm) motors[selected_motor].target = min_mm;
-        if (motors[selected_motor].target > max_mm) motors[selected_motor].target = max_mm;
-      } else {
-        menu_index[menu_level] += delta;
+  // Show IP for first 10 seconds
+  if (millis() - displayStartTime < 10000) {
+    if (showIP) {
+      drawIPDisplay();
+    }
+    if (millis() - displayStartTime >= 10000 && showIP) {
+      showIP = false;
+      drawMenu();
+    }
+  } else {
+    // Handle encoder scrolling
+    if (encoder_delta != 0) {
+      if (millis() - lastEncoderUpdate > ENCODER_DEBOUNCE) {
+        lastEncoderUpdate = millis();
         
-        switch (menu_level) {
-          case 0:
-            menu_index[0] = constrain(menu_index[0], 0, 2);
-            break;
-          case 1:
-            menu_index[1] = constrain(menu_index[1], 0, 2);
-            break;
-          case 2:
-            menu_index[2] = constrain(menu_index[2], 0, 4);
-            break;
-          case 3:
-            menu_index[3] = constrain(menu_index[3], 0, 3);
-            break;
-          case 4:
-            menu_index[4] = constrain(menu_index[4], 0, 3);
-            break;
-          case 5:
-            menu_index[5] = constrain(menu_index[5], 0, 4);
-            break;
-          case 6:
-            menu_index[6] = constrain(menu_index[6], 0, 1);
-            break;
+        int8_t delta = (encoder_delta > 0) ? 1 : -1;
+        
+        if (menu_level == 4 && edit_value) {
+          motors[selected_motor].target += delta;
+          if (motors[selected_motor].target < min_mm) motors[selected_motor].target = min_mm;
+          if (motors[selected_motor].target > max_mm) motors[selected_motor].target = max_mm;
+        } else {
+          menu_index[menu_level] += delta;
+          
+          int max_indices[] = {2, 2, 4, 3, 3, 4, 1};
+          menu_index[menu_level] = constrain(menu_index[menu_level], 0, max_indices[menu_level]);
         }
+        
+        encoder_delta = 0;
+        drawMenu();
+        sendState();
+      }
+    }
+
+    // Handle encoder button
+    bool btnState = digitalRead(encoderPins[2]);
+    if (btnState == LOW && !btnPressed && millis() - lastDebounce > 300) {
+      btnPressed = true;
+      lastDebounce = millis();
+
+      switch (menu_level) {
+        case 0:
+          if (menu_index[0] == 0) {
+            menu_level = 1;
+            menu_index[1] = 0;
+          } else if (menu_index[0] == 1) {
+            menu_level = 5;
+            menu_index[5] = 0;
+          } else if (menu_index[0] == 2) {
+            menu_level = 6;
+            menu_index[6] = 0;
+          }
+          break;
+          
+        case 1:
+          if (menu_index[1] == 0) {
+            menu_level = 3;
+            menu_index[3] = 0;
+            selected_motor = -1;
+          } else if (menu_index[1] == 1) {
+            menu_level = 2;
+            menu_index[2] = 0;
+          } else if (menu_index[1] == 2) {
+            menu_level = 0;
+          }
+          break;
+          
+        case 2:
+          if (menu_index[2] == 4) {
+            menu_level = 1;
+          } else {
+            selected_motor = menu_index[2];
+            menu_level = 3;
+            menu_index[3] = 0;
+          }
+          break;
+          
+        case 3:
+          selected_action = menu_index[3];
+          if (selected_action == 3) {
+            menu_level = (selected_motor == -1) ? 1 : 2;
+          } 
+          else if (selected_action == 0) {
+            menu_level = 4;
+            menu_index[4] = 0;
+            edit_value = false;
+          } 
+          else if (selected_action == 1) {
+            if (selected_motor == -1) {
+              toggleAllFullForward();
+            } else {
+              toggleFullForward(selected_motor);
+            }
+          }
+          else if (selected_action == 2) {
+            if (selected_motor == -1) {
+              toggleAllFullBackward();
+            } else {
+              toggleFullBackward(selected_motor);
+            }
+          }
+          break;
+          
+        case 4:
+          if (menu_index[4] == 0) {
+            edit_value = !edit_value;
+          } 
+          else if (menu_index[4] == 2) {
+            if (selected_motor == -1) {
+              for (int i = 0; i < 4; i++) {
+                setMotorTarget(i, motors[i].target);
+              }
+            } else {
+              setMotorTarget(selected_motor, motors[selected_motor].target);
+            }
+          } 
+          else if (menu_index[4] == 3) {
+            menu_level = 3;
+            edit_value = false;
+          }
+          break;
+          
+        case 5:
+          if (menu_index[5] == 4) {
+            menu_level = 0;
+          } else {
+            toggleCalibration(menu_index[5]);
+          }
+          break;
+          
+        case 6:
+          if (menu_index[6] == 0) {
+            setServoState(!servoState);
+          } 
+          else if (menu_index[6] == 1) {
+            menu_level = 0;
+          }
+          break;
       }
       
-      encoder_delta = 0;
       drawMenu();
       sendState();
+    } else if (btnState == HIGH && btnPressed) {
+      btnPressed = false;
     }
-  }
 
-  bool btnState = digitalRead(ENCODER_BTN);
-  if (btnState == LOW && !btnPressed && millis() - lastDebounce > 300) {
-    btnPressed = true;
-    lastDebounce = millis();
-
-    switch (menu_level) {
-      case 0:
-        if (menu_index[0] == 0) {
-          menu_level = 1;
-          menu_index[1] = 0;
-        } else if (menu_index[0] == 1) {
-          menu_level = 5;
-          menu_index[5] = 0;
-        } else if (menu_index[0] == 2) {
-          menu_level = 6;
-          menu_index[6] = 0;
-        }
-        break;
-        
-      case 1:
-        if (menu_index[1] == 0) {
-          menu_level = 3;
-          menu_index[3] = 0;
-          selected_motor = -1;
-        } else if (menu_index[1] == 1) {
-          menu_level = 2;
-          menu_index[2] = 0;
-        } else if (menu_index[1] == 2) {
-          menu_level = 0;
-        }
-        break;
-        
-      case 2:
-        if (menu_index[2] == 4) {
-          menu_level = 1;
-        } else {
-          selected_motor = menu_index[2];
-          menu_level = 3;
-          menu_index[3] = 0;
-        }
-        break;
-        
-      case 3:
-        selected_action = menu_index[3];
-        if (selected_action == 3) {
-          if (selected_motor == -1) {
-            menu_level = 1;
-            } else {
-            menu_level = 2;
-          }
-        } 
-        else if (selected_action == 0) {
-          if (selected_motor == -1) {
-            menu_level = 4;
-            menu_index[4] = 0;
-            edit_value = false;
-          } else {
-            menu_level = 4;
-            menu_index[4] = 0;
-            edit_value = false;
-          }
-        } 
-        else if (selected_action == 1) {
-          if (selected_motor == -1) {
-            toggleAllFullForward();
-          } else {
-            toggleFullForward(selected_motor);
-          }
-        }
-        else if (selected_action == 2) {
-          if (selected_motor == -1) {
-            toggleAllFullBackward();
-          } else {
-            toggleFullBackward(selected_motor);
-          }
-        }
-        break;
-        
-      case 4:
-        if (menu_index[4] == 0) {
-          edit_value = !edit_value;
-        } 
-        else if (menu_index[4] == 2) {
-          if (selected_motor == -1) {
-            for (int i = 0; i < 4; i++) {
-              setMotorTarget(i, motors[i].target);
-            }
-          } else {
-            setMotorTarget(selected_motor, motors[selected_motor].target);
-          }
-        } 
-        else if (menu_index[4] == 3) {
-          menu_level = 3;
-          edit_value = false;
-        }
-        break;
-        
-      case 5:
-        if (menu_index[5] == 4) {
-          menu_level = 0;
-        } else {
-          toggleCalibration(menu_index[5]);
-        }
-        break;
-        
-      case 6:
-        if (menu_index[6] == 0) {
-          setServoState(!servoState);
-        } 
-        else if (menu_index[6] == 1) {
-          menu_level = 0;
-        }
-        break;
-    }
-    
-    drawMenu();
-    sendState();
-  } else if (btnState == HIGH && btnPressed) {
-    btnPressed = false;
-  }
-
-  // Перевірка кінцевиків для кожного двигуна окремо
-  for (int i = 0; i < 4; i++) {
-    if (motors[i].calibrating && digitalRead(motors[i].limitSwitchPin) == HIGH) {
-      stopMotor(i);
-      motors[i].manual_distance = 0;
-      motors[i].real_position = 0;
-      sendState();
-      drawMenu();
-    }
-  }
-
-  unsigned long current_time = millis();
-  for (int i = 0; i < 4; i++) {
-    if (motors[i].running) {
-      if (current_time - motors[i].move_start_time >= ms_per_mm) {
-        motors[i].move_start_time = current_time;
-        
-        if (motors[i].dir > 0) {
-          motors[i].real_position++;
-        } else if (motors[i].dir < 0) {
-          motors[i].real_position--;
-        }
-
-        if (!motors[i].fullForward && !motors[i].fullBackward && !motors[i].calibrating) {
-          if (motors[i].dir > 0) {
-            motors[i].manual_distance++;
-          } else if (motors[i].dir < 0) {
-            motors[i].manual_distance--;
-          }
-          
-          if ((motors[i].dir > 0 && motors[i].manual_distance >= motors[i].target) ||
-              (motors[i].dir < 0 && motors[i].manual_distance <= motors[i].target)) {
-            stopMotor(i);
-          }
-        }
-        
-        // Відправляємо оновлення стану після кожної зміни позиції
+    // Check limit switches for each motor
+    for (int i = 0; i < 4; i++) {
+      if (motors[i].calibrating && digitalRead(limitPins[i]) == HIGH) {
+        stopMotor(i);
+        motors[i].manual_distance = 0;
+        motors[i].real_position = 0;
         sendState();
         drawMenu();
+      }
+    }
+
+    // Update motor positions
+    unsigned long current_time = millis();
+    for (int i = 0; i < 4; i++) {
+      if (motors[i].running) {
+        if (current_time - motors[i].move_start_time >= ms_per_mm) {
+          motors[i].move_start_time = current_time;
+          
+          if (motors[i].dir > 0) {
+            motors[i].real_position++;
+          } else if (motors[i].dir < 0) {
+            motors[i].real_position--;
+          }
+
+          if (!motors[i].fullForward && !motors[i].fullBackward && !motors[i].calibrating) {
+            if (motors[i].dir > 0) {
+              motors[i].manual_distance++;
+            } else if (motors[i].dir < 0) {
+              motors[i].manual_distance--;
+            }
+            
+            if ((motors[i].dir > 0 && motors[i].manual_distance >= motors[i].target) ||
+                (motors[i].dir < 0 && motors[i].manual_distance <= motors[i].target)) {
+              stopMotor(i);
+            }
+          }
+          
+          sendState();
+          drawMenu();
+        }
       }
     }
   }
