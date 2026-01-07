@@ -49,6 +49,7 @@ struct Motor {
   int target = 0;
   bool running = false;
   unsigned long move_start_time = 0;
+  unsigned long last_position_update = 0;
   int dir = 0;
   bool fullForward = false;
   bool fullBackward = false;
@@ -361,9 +362,12 @@ void startMotor(int motor, int dir) {
   motors[motor].running = true;
   motors[motor].dir = dir;
   motors[motor].move_start_time = millis();
+  motors[motor].last_position_update = millis();
   
   digitalWrite(motorPins[motor][0], dir > 0 ? HIGH : LOW);
   digitalWrite(motorPins[motor][1], dir < 0 ? HIGH : LOW);
+  
+  Serial.printf("Motor %d started, direction: %d\n", motor, dir);
 }
 
 void stopMotor(int motor) {
@@ -376,6 +380,8 @@ void stopMotor(int motor) {
   
   digitalWrite(motorPins[motor][0], LOW);
   digitalWrite(motorPins[motor][1], LOW);
+  
+  Serial.printf("Motor %d stopped\n", motor);
   
   sendState();
   drawMenu();
@@ -480,7 +486,6 @@ void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventTyp
       AwsFrameInfo *info = (AwsFrameInfo*)arg;
       if (info->final && info->index == 0 && info->len == len && info->opcode == WS_TEXT) {
         data[len] = 0;
-        Serial.printf("WebSocket message: %s\n", data);
         
         JsonDocument doc;
         DeserializationError error = deserializeJson(doc, data);
@@ -557,7 +562,7 @@ void sendState() {
     char motorKey[10];
     sprintf(motorKey, "motor%d", i);
     
-    JsonObject motorData = doc[motorKey].to<JsonObject>();
+    JsonObject motorData = doc.createNestedObject(motorKey);
     motorData["position"] = motors[i].real_position;
     motorData["target"] = motors[i].target;
     motorData["running"] = motors[i].running;
@@ -580,6 +585,7 @@ void sendState() {
   
   String output;
   serializeJson(doc, output);
+  
   ws.textAll(output);
 }
 
@@ -587,6 +593,9 @@ void setMotorTarget(int motor, int target) {
   if (motor < 0 || motor > 3) return;
   
   motors[motor].target = target;
+  Serial.printf("Setting motor %d target to %d, current position: %d\n", 
+                motor, target, motors[motor].real_position);
+  
   motors[motor].running = true;
   
   if (motors[motor].target > motors[motor].real_position) {
@@ -602,34 +611,20 @@ void setMotorTarget(int motor, int target) {
 }
 
 void setupOTA() {
-  // Port defaults to 3232
-  // ArduinoOTA.setPort(3232);
-
-  // Hostname defaults to esp32-[MAC]
   ArduinoOTA.setHostname("esp32-stanok");
-
-  // No authentication by default
   ArduinoOTA.setPassword("ota123");
-
-  // Password can be set with it's md5 value as well
-  // MD5(admin) = 21232f297a57a5a743894a0e4a801fc3
-  // ArduinoOTA.setPasswordHash("21232f297a57a5a743894a0e4a801fc3");
 
   ArduinoOTA
     .onStart([]() {
       String type;
       if (ArduinoOTA.getCommand() == U_FLASH)
         type = "sketch";
-      else // U_SPIFFS
+      else
         type = "filesystem";
 
-      // NOTE: if updating SPIFFS this would be the place to unmount SPIFFS using SPIFFS.end()
       Serial.println("Start updating " + type);
-      
-      // Stop all motors for safety
       stopAllMotors();
       
-      // Clear OLED and show updating message
       display.clearDisplay();
       display.setTextSize(1);
       display.setTextColor(SSD1306_WHITE);
@@ -651,7 +646,6 @@ void setupOTA() {
     .onProgress([](unsigned int progress, unsigned int total) {
       Serial.printf("Progress: %u%%\r", (progress / (total / 100)));
       
-      // Show progress on OLED
       display.clearDisplay();
       display.setTextSize(1);
       display.setTextColor(SSD1306_WHITE);
@@ -668,7 +662,6 @@ void setupOTA() {
       else if (error == OTA_RECEIVE_ERROR) Serial.println("Receive Failed");
       else if (error == OTA_END_ERROR) Serial.println("End Failed");
       
-      // Show error on OLED
       display.clearDisplay();
       display.setTextSize(1);
       display.setTextColor(SSD1306_WHITE);
@@ -682,15 +675,12 @@ void setupOTA() {
   Serial.println("OTA Ready");
   Serial.print("IP address: ");
   Serial.println(WiFi.localIP());
-  Serial.println("Use your OTA tool to upload");
 }
 
 void handleWebServer() {
-  // Setup WebSocket
   ws.onEvent(onWsEvent);
   server.addHandler(&ws);
 
-  // Serve static files from LittleFS
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
     request->send(LittleFS, "/index.html", "text/html");
   });
@@ -703,7 +693,6 @@ void handleWebServer() {
     request->send(LittleFS, "/script.js", "application/javascript");
   });
 
-  // Start server
   server.begin();
   Serial.println("HTTP server started");
 }
@@ -713,20 +702,17 @@ void setup() {
   Serial.println("\n\nBooting...");
   setupI2C();
 
-  // Initialize OLED
   if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
     Serial.println("OLED init failed");
     for (;;);
   }
 
-  // Initialize encoder
   for (int i = 0; i < 3; i++) {
     pinMode(encoderPins[i], INPUT_PULLUP);
   }
   attachInterrupt(digitalPinToInterrupt(encoderPins[0]), readEncoder, CHANGE);
   attachInterrupt(digitalPinToInterrupt(encoderPins[1]), readEncoder, CHANGE);
 
-  // Initialize motor pins
   for (int i = 0; i < 4; i++) {
     for (int j = 0; j < 2; j++) {
       pinMode(motorPins[i][j], OUTPUT);
@@ -734,15 +720,12 @@ void setup() {
     }
   }
   
-  // Initialize limit switches
   for (int i = 0; i < 4; i++) {
     pinMode(limitPins[i], INPUT_PULLUP);
   }
   
-  // Initialize LittleFS
   if (!LittleFS.begin()) {
     Serial.println("LittleFS mount failed");
-    // Format LittleFS if mount fails
     Serial.println("Formatting LittleFS...");
     LittleFS.format();
     if (!LittleFS.begin()) {
@@ -751,17 +734,21 @@ void setup() {
   }
   Serial.println("LittleFS mounted successfully");
 
-  // Initialize WiFiManager
-  wm.setConfigPortalTimeout(180); // 3 minutes timeout
-  
-  // Reset settings - wipe stored credentials for testing
-  // wm.resetSettings();
-  
-  // Set custom hostname for mDNS
+  // Initialize all motor states
+  for (int i = 0; i < 4; i++) {
+    motors[i].real_position = 0;
+    motors[i].target = 0;
+    motors[i].manual_distance = 0;
+    motors[i].running = false;
+    motors[i].fullForward = false;
+    motors[i].fullBackward = false;
+    motors[i].calibrating = false;
+    Serial.printf("Motor %d initialized\n", i);
+  }
+
+  wm.setConfigPortalTimeout(180);
   wm.setHostname("esp32-stanok");
   
-  // Automatically connect using saved credentials,
-  // if connection fails, it starts an access point with the specified name
   bool res = wm.autoConnect("ESP32-Config", "config123");
   
   if (!res) {
@@ -775,17 +762,12 @@ void setup() {
   Serial.print("Hostname: ");
   Serial.println(WiFi.getHostname());
 
-  // Show IP on OLED for 10 seconds
   displayStartTime = millis();
   drawIPDisplay();
 
-  // Setup OTA FIRST
   setupOTA();
-  
-  // Then setup Web Server
   handleWebServer();
 
-  // Initialize servos
   setServoState(false);
   
   Serial.println("Setup complete!");
@@ -794,7 +776,6 @@ void setup() {
 void loop() {
   ArduinoOTA.handle();
   
-  // Show IP for first 10 seconds
   if (millis() - displayStartTime < 10000) {
     if (showIP) {
       drawIPDisplay();
@@ -828,7 +809,6 @@ void loop() {
       }
     }
 
-    // Handle encoder button
     bool btnState = digitalRead(encoderPins[2]);
     if (btnState == LOW && !btnPressed && millis() - lastDebounce > 300) {
       btnPressed = true;
@@ -940,7 +920,7 @@ void loop() {
       btnPressed = false;
     }
 
-    // Check limit switches for each motor
+    // Check limit switches
     for (int i = 0; i < 4; i++) {
       if (motors[i].calibrating && digitalRead(limitPins[i]) == HIGH) {
         stopMotor(i);
@@ -951,12 +931,12 @@ void loop() {
       }
     }
 
-    // Update motor positions
+    // Update motor positions - ONLY when moving to a target (not in full forward/backward mode)
     unsigned long current_time = millis();
     for (int i = 0; i < 4; i++) {
-      if (motors[i].running) {
-        if (current_time - motors[i].move_start_time >= ms_per_mm) {
-          motors[i].move_start_time = current_time;
+      if (motors[i].running && !motors[i].fullForward && !motors[i].fullBackward) {
+        if (current_time - motors[i].last_position_update >= ms_per_mm) {
+          motors[i].last_position_update = current_time;
           
           if (motors[i].dir > 0) {
             motors[i].real_position++;
@@ -964,19 +944,22 @@ void loop() {
             motors[i].real_position--;
           }
 
-          if (!motors[i].fullForward && !motors[i].fullBackward && !motors[i].calibrating) {
-            if (motors[i].dir > 0) {
-              motors[i].manual_distance++;
-            } else if (motors[i].dir < 0) {
-              motors[i].manual_distance--;
-            }
-            
+          // Update manual distance for target tracking
+          if (motors[i].dir > 0) {
+            motors[i].manual_distance++;
+          } else if (motors[i].dir < 0) {
+            motors[i].manual_distance--;
+          }
+          
+          // Check if target reached
+          if (!motors[i].calibrating) {
             if ((motors[i].dir > 0 && motors[i].manual_distance >= motors[i].target) ||
                 (motors[i].dir < 0 && motors[i].manual_distance <= motors[i].target)) {
               stopMotor(i);
             }
           }
           
+          // Update web interface
           sendState();
           drawMenu();
         }
