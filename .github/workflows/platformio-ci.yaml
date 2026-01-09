@@ -1,0 +1,104 @@
+name: PlatformIO Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+env:
+  PLATFORMIO_VERSION: "6.1.7"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+      with:
+        submodules: recursive
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.9'
+    
+    - name: Install PlatformIO
+      run: |
+        pip install --upgrade pip
+        pip install platformio==$PLATFORMIO_VERSION
+    
+    - name: Build Firmware
+      run: |
+        pio run --environment esp32dev
+        echo "Firmware built successfully"
+    
+    - name: Build LittleFS Image
+      run: |
+        pio run --target buildfs --environment esp32dev
+        echo "LittleFS image built successfully"
+    
+    - name: Get Version Info
+      id: version
+      run: |
+        if [[ ${{ github.ref }} == refs/tags/* ]]; then
+          TAG_NAME=${GITHUB_REF#refs/tags/}
+          echo "VERSION=${TAG_NAME}" >> $GITHUB_ENV
+          echo "RELEASE_NAME=${TAG_NAME}" >> $GITHUB_ENV
+        else
+          DATE=$(date +'%Y.%m.%d')
+          COMMIT_HASH=$(git rev-parse --short HEAD)
+          echo "VERSION=${DATE}-${COMMIT_HASH}" >> $GITHUB_ENV
+          echo "RELEASE_NAME=Development Build ${DATE}" >> $GITHUB_ENV
+        fi
+        echo "Version: ${{ env.VERSION }}"
+    
+    - name: Prepare Release Files
+      run: |
+        mkdir -p release
+        cp .pio/build/esp32dev/firmware.bin release/firmware-${{ env.VERSION }}.bin
+        cp .pio/build/esp32dev/littlefs.bin release/littlefs-${{ env.VERSION }}.bin
+        
+        # Create manifest file
+        cat > release/manifest.json << EOF
+        {
+          "version": "${{ env.VERSION }}",
+          "build_date": "$(date -Iseconds)",
+          "firmware_file": "firmware-${{ env.VERSION }}.bin",
+          "littlefs_file": "littlefs-${{ env.VERSION }}.bin",
+          "commit_hash": "${{ github.sha }}"
+        }
+        EOF
+        
+        # Create simple firmware.bin and littlefs.bin (latest)
+        cp .pio/build/esp32dev/firmware.bin release/firmware.bin
+        cp .pio/build/esp32dev/littlefs.bin release/littlefs.bin
+        
+        ls -la release/
+    
+    - name: Create Release
+      if: startsWith(github.ref, 'refs/tags/')
+      id: create_release
+      uses: softprops/action-gh-release@v1
+      with:
+        name: Release ${{ env.RELEASE_NAME }}
+        draft: false
+        prerelease: false
+        generate_release_notes: true
+        files: |
+          release/firmware-${{ env.VERSION }}.bin
+          release/littlefs-${{ env.VERSION }}.bin
+          release/firmware.bin
+          release/littlefs.bin
+          release/manifest.json
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    
+    - name: Upload Development Build Artifacts
+      if: github.ref != 'refs/tags/v*'
+      uses: actions/upload-artifact@v3
+      with:
+        name: firmware-build-${{ env.VERSION }}
+        path: release/
+        retention-days: 7

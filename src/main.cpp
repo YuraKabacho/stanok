@@ -14,27 +14,37 @@
 #include <Adafruit_SSD1306.h>
 #include <ESP32Servo.h>
 
+// ==== OTA Update Includes ====
+#include <HTTPClient.h>
+#include <Update.h>
+
 // ==== OLED ====
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 
 // ==== Pin Definitions ====
-const int encoderPins[] = {25, 33, 32}; // CLK, DT, SW
-const int motorPins[4][2] = {
+static const int encoderPins[] = {25, 33, 32}; // CLK, DT, SW
+static const int motorPins[4][2] = {
   {15, 14}, // M1: IN1, IN2
   {13, 12}, // M2: IN1, IN2
-  {27, 26},  // M3: IN1, IN2
+  {27, 26}, // M3: IN1, IN2
   {5, 23}   // M4: IN1, IN2
 };
-const int limitPins[] = {2, 4, 35, 34};
-const int servoPins[] = {18, 19};
+static const int limitPins[] = {2, 4, 35, 34};
+static const int servoPins[] = {18, 19};
 
 // ==== Parameters ====
-const int max_mm = 20;
-const int min_mm = 0;
-const int ms_per_mm = 6800;
-#define ENCODER_DEBOUNCE 40
+static const int max_mm = 20;
+static const int min_mm = 0;
+static const int ms_per_mm = 6800;
+static const uint32_t ENCODER_DEBOUNCE = 40;
+static const uint32_t UPDATE_CHECK_INTERVAL = 300000; // 5 minutes
+
+// ==== OTA Update Settings ====
+const char* GITHUB_REPO = "YuraKabacho/stanok";
+const char* FIRMWARE_FILENAME = "firmware.bin";
+const char* LITTLEFS_FILENAME = "littlefs.bin";
 
 // ==== Global Variables ====
 Servo myServo1, myServo2;
@@ -48,9 +58,9 @@ struct Motor {
   int real_position = 0;
   int target = 0;
   bool running = false;
-  unsigned long move_start_time = 0;
-  unsigned long last_position_update = 0;
-  int dir = 0;
+  uint32_t move_start_time = 0;
+  uint32_t last_position_update = 0;
+  int8_t dir = 0;
   bool fullForward = false;
   bool fullBackward = false;
   bool calibrating = false;
@@ -59,33 +69,45 @@ struct Motor {
 Motor motors[4];
 
 // Menu variables
-int menu_level = 0;
-int menu_index[7] = {0};
-int selected_motor = 0;
-int selected_action = 0;
+int8_t menu_level = 0;
+int8_t menu_index[7] = {0};
+int8_t selected_motor = 0;
+int8_t selected_action = 0;
 bool edit_value = false;
 
 // Encoder variables
 volatile int8_t encoder_delta = 0;
-unsigned long lastEncoderUpdate = 0;
-unsigned long lastDebounce = 0;
+uint32_t lastEncoderUpdate = 0;
+uint32_t lastDebounce = 0;
 bool btnPressed = false;
 
 // Display timer
-unsigned long displayStartTime = 0;
+uint32_t displayStartTime = 0;
 bool showIP = true;
 
 // WiFi Manager instance
 WiFiManager wm;
+
+// Update variables
+enum UpdateType { UPDATE_NONE, UPDATE_FIRMWARE, UPDATE_LITTLEFS };
+UpdateType currentUpdateType = UPDATE_NONE;
+bool updateInProgress = false;
+int updateProgress = 0;
+String updateStatus = "";
+uint32_t lastUpdateCheck = 0;
+String latestVersion = "";
+String latestFirmwareUrl = "";
+String latestLittleFSUrl = "";
 
 // Function prototypes
 void setServoState(bool state);
 void setMotorTarget(int motor, int target);
 void drawMenu();
 void drawIPDisplay();
+void drawOTAProgress();
 void sendState();
 void toggleCalibration(int motor);
-void startMotor(int motor, int dir);
+void startMotor(int motor, int8_t dir);
 void stopMotor(int motor);
 void stopAllMotors();
 void toggleFullForward(int motor);
@@ -97,6 +119,9 @@ void IRAM_ATTR readEncoder();
 void setupI2C();
 void setupOTA();
 void handleWebServer();
+String checkForUpdates();
+bool performUpdate(String url, UpdateType type);
+void sendUpdateStatus();
 
 // ==== I2C ====
 void setupI2C() {
@@ -104,16 +129,209 @@ void setupI2C() {
   Wire.setClock(400000);
 }
 
+// ==== OTA Update Functions ====
+String checkForUpdates() {
+  if (WiFi.status() != WL_CONNECTED) {
+    return "";
+  }
+  
+  HTTPClient http;
+  String url = "https://api.github.com/repos/" + String(GITHUB_REPO) + "/releases/latest";
+  
+  http.begin(url);
+  http.setUserAgent("ESP32-OTA");
+  
+  int httpCode = http.GET();
+  
+  if (httpCode == HTTP_CODE_OK) {
+    String payload = http.getString();
+    http.end();
+    
+    JsonDocument doc;
+    DeserializationError error = deserializeJson(doc, payload);
+    
+    if (error) {
+      return "";
+    }
+    
+    latestVersion = doc["tag_name"].as<String>();
+    latestFirmwareUrl = "";
+    latestLittleFSUrl = "";
+    
+    // Find firmware.bin and littlefs.bin assets
+    JsonArray assets = doc["assets"].as<JsonArray>();
+    for (JsonObject asset : assets) {
+      String name = asset["name"].as<String>();
+      String downloadUrl = asset["browser_download_url"].as<String>();
+      
+      if (name == FIRMWARE_FILENAME) {
+        latestFirmwareUrl = downloadUrl;
+      } else if (name == LITTLEFS_FILENAME) {
+        latestLittleFSUrl = downloadUrl;
+      }
+    }
+    
+    // Return JSON with both URLs
+    JsonDocument responseDoc;
+    responseDoc["firmware_url"] = latestFirmwareUrl;
+    responseDoc["littlefs_url"] = latestLittleFSUrl;
+    responseDoc["latest_version"] = latestVersion;
+    
+    String response;
+    serializeJson(responseDoc, response);
+    return response;
+  }
+  
+  http.end();
+  return "";
+}
+
+bool performUpdate(String url, UpdateType type) {
+  if (WiFi.status() != WL_CONNECTED) {
+    updateStatus = "WiFi not connected";
+    return false;
+  }
+  
+  HTTPClient http;
+  http.begin(url);
+  http.setUserAgent("ESP32-OTA");
+  
+  int httpCode = http.GET();
+  
+  if (httpCode == HTTP_CODE_OK) {
+    int contentLength = http.getSize();
+    
+    if (contentLength <= 0) {
+      updateStatus = "Invalid content length";
+      http.end();
+      return false;
+    }
+    
+    // Check if we have enough space
+    if (type == UPDATE_FIRMWARE && contentLength > (ESP.getFreeSketchSpace() - 0x1000)) {
+      updateStatus = "Not enough space for firmware";
+      http.end();
+      return false;
+    }
+    
+    // Start update
+    int cmd = (type == UPDATE_FIRMWARE) ? U_FLASH : U_SPIFFS;
+    if (!Update.begin(contentLength, cmd)) {
+      updateStatus = "Update begin failed: " + String(Update.getError());
+      http.end();
+      return false;
+    }
+    
+    // Get update stream
+    WiFiClient *stream = http.getStreamPtr();
+    uint8_t buffer[2048]; // Increased buffer size
+    size_t totalRead = 0;
+    uint32_t lastProgressUpdate = 0;
+    
+    while (http.connected() && totalRead < (size_t)contentLength) {
+      size_t toRead = min(sizeof(buffer), (size_t)contentLength - totalRead);
+      size_t read = stream->readBytes(buffer, toRead);
+      
+      if (read > 0) {
+        Update.write(buffer, read);
+        totalRead += read;
+        
+        // Update progress every 2%
+        int newProgress = (totalRead * 100) / contentLength;
+        if (newProgress > updateProgress || millis() - lastProgressUpdate > 500) {
+          updateProgress = newProgress;
+          lastProgressUpdate = millis();
+          sendUpdateStatus();
+          
+          // Update display less frequently
+          if (millis() - lastEncoderUpdate > 500) {
+            drawOTAProgress();
+            lastEncoderUpdate = millis();
+          }
+        }
+      }
+      
+      // Small delay to prevent watchdog trigger
+      delay(1);
+    }
+    
+    http.end();
+    
+    if (Update.end()) {
+      updateStatus = (type == UPDATE_FIRMWARE) ? "Firmware update complete! Restarting..." : "LittleFS update complete!";
+      updateProgress = 100;
+      sendUpdateStatus();
+      
+      if (type == UPDATE_FIRMWARE) {
+        delay(2000);
+        ESP.restart();
+      }
+      return true;
+    } else {
+      updateStatus = "Update failed: " + String(Update.getError());
+      return false;
+    }
+  } else {
+    updateStatus = "HTTP error: " + String(httpCode);
+    http.end();
+    return false;
+  }
+}
+
+void drawOTAProgress() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  
+  display.setCursor(0, 0);
+  display.println(currentUpdateType == UPDATE_FIRMWARE ? "FIRMWARE UPDATE" : "LITTLEFS UPDATE");
+  display.println("==========");
+  
+  // Handle long status messages
+  String displayStatus = updateStatus;
+  if (displayStatus.length() > 21) {
+    displayStatus = displayStatus.substring(0, 21);
+  }
+  display.setCursor(0, 20);
+  display.println(displayStatus);
+  
+  // Progress bar
+  int barWidth = SCREEN_WIDTH - 4;
+  int barHeight = 10;
+  int barX = 2;
+  int barY = SCREEN_HEIGHT - barHeight - 10;
+  
+  display.drawRect(barX, barY, barWidth, barHeight, SSD1306_WHITE);
+  int progressWidth = (updateProgress * (barWidth - 2)) / 100;
+  display.fillRect(barX + 1, barY + 1, progressWidth, barHeight - 2, SSD1306_WHITE);
+  
+  // Draw percentage
+  display.setCursor(SCREEN_WIDTH/2 - 10, barY - 12);
+  display.printf("%d%%", updateProgress);
+  
+  display.display();
+}
+
+void sendUpdateStatus() {
+  JsonDocument doc;
+  doc["type"] = "update_status";
+  doc["status"] = updateStatus;
+  doc["progress"] = updateProgress;
+  doc["inProgress"] = updateInProgress;
+  doc["latestVersion"] = latestVersion;
+  doc["updateType"] = (currentUpdateType == UPDATE_FIRMWARE) ? "firmware" : "littlefs";
+  
+  String output;
+  serializeJson(doc, output);
+  ws.textAll(output);
+}
+
 // ==== Servo Control Function ====
 void setServoState(bool state) {
   servoState = state;
   if (servoState) {
-    if (!myServo1.attached()) {
-      myServo1.attach(servoPins[0], 500, 2400);
-    }
-    if (!myServo2.attached()) {
-      myServo2.attach(servoPins[1], 500, 2400);
-    }
+    if (!myServo1.attached()) myServo1.attach(servoPins[0], 500, 2400);
+    if (!myServo2.attached()) myServo2.attach(servoPins[1], 500, 2400);
     myServo1.write(180);
     myServo2.write(180);
   } else {
@@ -136,16 +354,13 @@ void drawIPDisplay() {
   display.setTextSize(2);
   if (WiFi.status() == WL_CONNECTED) {
     display.println(WiFi.localIP().toString());
-    display.setTextSize(1);
-    display.println("");
-    display.println("Connected!");
-    display.println("OTA Ready");
   } else {
     display.println("No WiFi");
-    display.setTextSize(1);
-    display.println("");
-    display.println("AP Mode");
   }
+  
+  display.setTextSize(1);
+  display.setCursor(0, 48);
+  display.println(WiFi.status() == WL_CONNECTED ? "Connected! OTA Ready" : "AP Mode");
   
   display.display();
 }
@@ -159,18 +374,21 @@ void drawMenu() {
   display.drawRect(0, 0, SCREEN_WIDTH, 14, SSD1306_WHITE);
   display.setCursor(4, 4);
   
-  const char* headers[] = {
+  static const char* headers[] = {
     "MAIN MENU", "MOTOR CONTROL TYPE", "MOTOR SELECT", 
     "ACTION SELECT", "DISTANCE CONTROL", "CALIBRATION", "SERVO CONTROL"
   };
-  display.print(headers[menu_level]);
+  
+  if (menu_level < 7) {
+    display.print(headers[menu_level]);
+  }
 
   // Display menu items
   display.setCursor(0, 16);
 
   switch (menu_level) {
     case 0: {
-      const char* items[] = {"Motor Control", "Calibration", "Servo Control"};
+      static const char* items[] = {"Motor Control", "Calibration", "Servo Control"};
       for (int i = 0; i < 3; i++) {
         if (i == menu_index[0]) {
           display.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
@@ -184,7 +402,7 @@ void drawMenu() {
     }
       
     case 1: {
-      const char* items[] = {"All Motors", "Single Motor", "Back"};
+      static const char* items[] = {"All Motors", "Single Motor", "Back"};
       for (int i = 0; i < 3; i++) {
         if (i == menu_index[1]) {
           display.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
@@ -198,7 +416,7 @@ void drawMenu() {
     }
       
     case 2: {
-      const char* items[] = {"Motor 0", "Motor 1", "Motor 2", "Motor 3", "Back"};
+      static const char* items[] = {"Motor 0", "Motor 1", "Motor 2", "Motor 3", "Back"};
       for (int i = 0; i < 5; i++) {
         if (i == menu_index[2]) {
           display.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
@@ -212,45 +430,51 @@ void drawMenu() {
     }
       
     case 3: {
-      const char* items[] = {"Distance Control", "Forward", "Backward", "Back"};
+      static const char* items[] = {"Distance Control", "Forward", "Backward", "Back"};
       for (int i = 0; i < 4; i++) {
-        if (i == menu_index[3]) {
+        bool isSelected = (i == menu_index[3]);
+        
+        if (isSelected) {
           display.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
-          if (i == 1) {
-            display.printf("> Forward [%s] \n", motors[selected_motor].fullForward ? "ON" : "OFF");
-          } else if (i == 2) {
-            display.printf("> Backward [%s] \n", motors[selected_motor].fullBackward ? "ON" : "OFF");
-          } else {
-            display.printf("> %s \n", items[i]);
-          }
-          display.setTextColor(SSD1306_WHITE);
+        }
+        
+        if (i == 1) {
+          display.printf("%s Forward [%s] \n", isSelected ? ">" : " ", 
+                         motors[selected_motor].fullForward ? "ON" : "OFF");
+        } else if (i == 2) {
+          display.printf("%s Backward [%s] \n", isSelected ? ">" : " ", 
+                         motors[selected_motor].fullBackward ? "ON" : "OFF");
         } else {
-          if (i == 1) {
-            display.printf("  Forward [%s] \n", motors[selected_motor].fullForward ? "ON" : "OFF");
-          } else if (i == 2) {
-            display.printf("  Backward [%s] \n", motors[selected_motor].fullBackward ? "ON" : "OFF");
-          } else {
-            display.printf("  %s \n", items[i]);
-          }
+          display.printf("%s %s \n", isSelected ? ">" : " ", items[i]);
+        }
+        
+        if (isSelected) {
+          display.setTextColor(SSD1306_WHITE);
         }
       }
       break;
     }
       
     case 4: {
-      if (menu_index[4] == 0 && edit_value) {
+      bool isTargetSelected = (menu_index[4] == 0);
+      bool isCurrentSelected = (menu_index[4] == 1);
+      bool isConfirmSelected = (menu_index[4] == 2);
+      bool isBackSelected = (menu_index[4] == 3);
+      
+      // Target row
+      if (isTargetSelected) {
         display.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
-        display.printf("> Target: [%d mm] \n", motors[selected_motor].target);
-        display.setTextColor(SSD1306_WHITE);
-      } else if (menu_index[4] == 0) {
-        display.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
-        display.printf("> Target: %d mm \n", motors[selected_motor].target);
+        display.printf("> Target: %s%d mm%s \n", 
+                      edit_value ? "[" : "", 
+                      motors[selected_motor].target,
+                      edit_value ? "]" : "");
         display.setTextColor(SSD1306_WHITE);
       } else {
         display.printf("  Target: %d mm \n", motors[selected_motor].target);
       }
 
-      if (menu_index[4] == 1) {
+      // Current row
+      if (isCurrentSelected) {
         display.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
         display.printf("> Current: %d mm \n", motors[selected_motor].real_position);
         display.setTextColor(SSD1306_WHITE);
@@ -258,7 +482,8 @@ void drawMenu() {
         display.printf("  Current: %d mm \n", motors[selected_motor].real_position);
       }
 
-      if (menu_index[4] == 2) {
+      // Confirm row
+      if (isConfirmSelected) {
         display.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
         display.println("> Confirm");
         display.setTextColor(SSD1306_WHITE);
@@ -266,7 +491,8 @@ void drawMenu() {
         display.println("  Confirm");
       }
 
-      if (menu_index[4] == 3) {
+      // Back row
+      if (isBackSelected) {
         display.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
         display.println("> Back");
         display.setTextColor(SSD1306_WHITE);
@@ -277,44 +503,46 @@ void drawMenu() {
     }
       
     case 5: {
-      const char* items[] = {"Cal. Motor 0", "Cal. Motor 1", "Cal. Motor 2", "Cal. Motor 3", "Back"};
+      static const char* items[] = {"Cal. Motor 0", "Cal. Motor 1", "Cal. Motor 2", "Cal. Motor 3", "Back"};
       for (int i = 0; i < 5; i++) {
-        if (i == menu_index[5]) {
+        bool isSelected = (i == menu_index[5]);
+        
+        if (isSelected) {
           display.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
-          if (i < 4) {
-            display.printf("> %s [%s]\n", items[i], motors[i].calibrating ? "ON" : "OFF");
-          } else {
-            display.printf("> %s \n", items[i]);
-          }
-          display.setTextColor(SSD1306_WHITE);
+        }
+        
+        if (i < 4) {
+          display.printf("%s %s [%s]\n", isSelected ? ">" : " ", items[i], 
+                         motors[i].calibrating ? "ON" : "OFF");
         } else {
-          if (i < 4) {
-            display.printf("  %s [%s]\n", items[i], motors[i].calibrating ? "ON" : "OFF");
-          } else {
-            display.printf("  %s \n", items[i]);
-          }
+          display.printf("%s %s \n", isSelected ? ">" : " ", items[i]);
+        }
+        
+        if (isSelected) {
+          display.setTextColor(SSD1306_WHITE);
         }
       }
       break;
     }
       
     case 6: {
-      const char* items[] = {"Servo ON/OFF", "Back"};
+      static const char* items[] = {"Servo ON/OFF", "Back"};
       for (int i = 0; i < 2; i++) {
-        if (i == menu_index[6]) {
+        bool isSelected = (i == menu_index[6]);
+        
+        if (isSelected) {
           display.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
-          if (i == 0) {
-            display.printf("> %s [%s]\n", items[i], servoState ? "ON" : "OFF");
-          } else {
-            display.printf("> %s \n", items[i]);
-          }
-          display.setTextColor(SSD1306_WHITE);
+        }
+        
+        if (i == 0) {
+          display.printf("%s %s [%s]\n", isSelected ? ">" : " ", items[i], 
+                         servoState ? "ON" : "OFF");
         } else {
-          if (i == 0) {
-            display.printf("  %s [%s]\n", items[i], servoState ? "ON" : "OFF");
-          } else {
-            display.printf("  %s \n", items[i]);
-          }
+          display.printf("%s %s \n", isSelected ? ">" : " ", items[i]);
+        }
+        
+        if (isSelected) {
+          display.setTextColor(SSD1306_WHITE);
         }
       }
       break;
@@ -340,8 +568,8 @@ void drawMenu() {
 // ==== Encoder ====
 void IRAM_ATTR readEncoder() {
   static uint8_t lastState = 0;
-  static unsigned long lastInterruptTime = 0;
-  unsigned long interruptTime = millis();
+  static uint32_t lastInterruptTime = 0;
+  uint32_t interruptTime = millis();
   
   if (interruptTime - lastInterruptTime < 5) return;
   lastInterruptTime = interruptTime;
@@ -356,7 +584,7 @@ void IRAM_ATTR readEncoder() {
 }
 
 // ==== Motor Control ====
-void startMotor(int motor, int dir) {
+void startMotor(int motor, int8_t dir) {
   if (motor < 0 || motor > 3) return;
   
   motors[motor].running = true;
@@ -366,8 +594,6 @@ void startMotor(int motor, int dir) {
   
   digitalWrite(motorPins[motor][0], dir > 0 ? HIGH : LOW);
   digitalWrite(motorPins[motor][1], dir < 0 ? HIGH : LOW);
-  
-  Serial.printf("Motor %d started, direction: %d\n", motor, dir);
 }
 
 void stopMotor(int motor) {
@@ -381,10 +607,8 @@ void stopMotor(int motor) {
   digitalWrite(motorPins[motor][0], LOW);
   digitalWrite(motorPins[motor][1], LOW);
   
-  Serial.printf("Motor %d stopped\n", motor);
-  
   sendState();
-  drawMenu();
+  if (!updateInProgress) drawMenu();
 }
 
 void stopAllMotors() {
@@ -403,7 +627,7 @@ void toggleFullForward(int motor) {
     startMotor(motor, 1);
   }
   sendState();
-  drawMenu();
+  if (!updateInProgress) drawMenu();
 }
 
 void toggleFullBackward(int motor) {
@@ -416,7 +640,7 @@ void toggleFullBackward(int motor) {
     startMotor(motor, -1);
   }
   sendState();
-  drawMenu();
+  if (!updateInProgress) drawMenu();
 }
 
 void toggleAllFullForward() {
@@ -467,19 +691,17 @@ void toggleCalibration(int motor) {
     startMotor(motor, -1);
   }
   sendState();
-  drawMenu();
+  if (!updateInProgress) drawMenu();
 }
 
 // WebSocket event handler
 void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType type, void *arg, uint8_t *data, size_t len) {
   switch(type) {
     case WS_EVT_CONNECT:
-      Serial.printf("WebSocket client #%u connected from %s\n", client->id(), client->remoteIP().toString().c_str());
-      sendState(); // Send initial state to new client
+      sendState();
       break;
       
     case WS_EVT_DISCONNECT:
-      Serial.printf("WebSocket client #%u disconnected\n", client->id());
       break;
       
     case WS_EVT_DATA: {
@@ -490,11 +712,7 @@ void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventTyp
         JsonDocument doc;
         DeserializationError error = deserializeJson(doc, data);
         
-        if (error) {
-          Serial.print(F("deserializeJson() failed: "));
-          Serial.println(error.f_str());
-          return;
-        }
+        if (error) return;
         
         const char* commandType = doc["type"];
         JsonObject dataObj = doc["data"];
@@ -541,11 +759,78 @@ void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventTyp
           toggleAllFullBackward();
         }
         else if (strcmp(commandType, "get_ip") == 0) {
-          sendState(); // Will include IP address
+          sendState();
+        }
+        else if (strcmp(commandType, "check_updates") == 0) {
+          String updateInfo = checkForUpdates();
+          if (updateInfo != "") {
+            JsonDocument responseDoc;
+            responseDoc["type"] = "update_info";
+            
+            // FIXED: Use new ArduinoJson API
+            JsonObject dataObj2 = responseDoc["data"].to<JsonObject>();
+            
+            JsonDocument updateDoc;
+            deserializeJson(updateDoc, updateInfo);
+            dataObj2["firmware_url"] = updateDoc["firmware_url"].as<String>();
+            dataObj2["littlefs_url"] = updateDoc["littlefs_url"].as<String>();
+            dataObj2["latest_version"] = updateDoc["latest_version"].as<String>();
+            
+            String output;
+            serializeJson(responseDoc, output);
+            ws.textAll(output);
+          }
+        }
+        else if (strcmp(commandType, "update_firmware") == 0) {
+          String firmwareUrl = dataObj["url"].as<String>();
+          if (firmwareUrl != "" && !updateInProgress) {
+            updateStatus = "Starting firmware update...";
+            updateInProgress = true;
+            currentUpdateType = UPDATE_FIRMWARE;
+            updateProgress = 0;
+            sendUpdateStatus();
+            
+            // Create a copy of the URL on the heap
+            String *urlCopy = new String(firmwareUrl);
+            
+            // Start update in background
+            xTaskCreate([](void *param) {
+              String *url = (String*)param;
+              performUpdate(*url, UPDATE_FIRMWARE);
+              delete url;
+              updateInProgress = false;
+              vTaskDelete(NULL);
+            }, "Firmware Update", 8192, urlCopy, 1, NULL);
+          }
+        }
+        else if (strcmp(commandType, "update_littlefs") == 0) {
+          String littlefsUrl = dataObj["url"].as<String>();
+          if (littlefsUrl != "" && !updateInProgress) {
+            updateStatus = "Starting LittleFS update...";
+            updateInProgress = true;
+            currentUpdateType = UPDATE_LITTLEFS;
+            updateProgress = 0;
+            sendUpdateStatus();
+            
+            String *urlCopy = new String(littlefsUrl);
+            
+            xTaskCreate([](void *param) {
+              String *url = (String*)param;
+              performUpdate(*url, UPDATE_LITTLEFS);
+              delete url;
+              updateInProgress = false;
+              vTaskDelete(NULL);
+            }, "LittleFS Update", 8192, urlCopy, 1, NULL);
+          }
         }
       }
       break;
     }
+      
+    case WS_EVT_PING:
+    case WS_EVT_PONG:
+      // Handle ping/pong if needed
+      break;
       
     case WS_EVT_ERROR:
       Serial.printf("WebSocket error\n");
@@ -560,9 +845,11 @@ void sendState() {
   // Send data for each motor (0-3)
   for (int i = 0; i < 4; i++) {
     char motorKey[10];
-    sprintf(motorKey, "motor%d", i);
+    snprintf(motorKey, sizeof(motorKey), "motor%d", i);
     
-    JsonObject motorData = doc.createNestedObject(motorKey);
+    // FIXED: Use new ArduinoJson API
+    JsonObject motorData = doc[motorKey].to<JsonObject>();
+    
     motorData["position"] = motors[i].real_position;
     motorData["target"] = motors[i].target;
     motorData["running"] = motors[i].running;
@@ -573,30 +860,26 @@ void sendState() {
   
   doc["servoState"] = servoState;
   doc["ip"] = WiFi.localIP().toString();
+  doc["updateInProgress"] = updateInProgress;
+  doc["updateProgress"] = updateProgress;
+  doc["updateStatus"] = updateStatus;
+  doc["latestVersion"] = latestVersion;
   
   bool any_running = false;
   for (int i = 0; i < 4; i++) {
-    if (motors[i].running) {
-      any_running = true;
-      break;
-    }
+    if (motors[i].running) any_running = true;
   }
   doc["globalStatus"] = any_running ? "RUNNING" : "STOPPED";
   
   String output;
   serializeJson(doc, output);
-  
   ws.textAll(output);
 }
 
 void setMotorTarget(int motor, int target) {
   if (motor < 0 || motor > 3) return;
   
-  motors[motor].target = target;
-  Serial.printf("Setting motor %d target to %d, current position: %d\n", 
-                motor, target, motors[motor].real_position);
-  
-  motors[motor].running = true;
+  motors[motor].target = constrain(target, min_mm, max_mm);
   
   if (motors[motor].target > motors[motor].real_position) {
     startMotor(motor, 1);
@@ -606,7 +889,7 @@ void setMotorTarget(int motor, int target) {
     stopMotor(motor);
   }
   
-  drawMenu();
+  if (!updateInProgress) drawMenu();
   sendState();
 }
 
@@ -622,9 +905,7 @@ void setupOTA() {
       else
         type = "filesystem";
 
-      Serial.println("Start updating " + type);
       stopAllMotors();
-      
       display.clearDisplay();
       display.setTextSize(1);
       display.setTextColor(SSD1306_WHITE);
@@ -634,7 +915,6 @@ void setupOTA() {
       display.display();
     })
     .onEnd([]() {
-      Serial.println("\nEnd");
       display.clearDisplay();
       display.setTextSize(1);
       display.setTextColor(SSD1306_WHITE);
@@ -644,8 +924,6 @@ void setupOTA() {
       display.display();
     })
     .onProgress([](unsigned int progress, unsigned int total) {
-      Serial.printf("Progress: %u%%\r", (progress / (total / 100)));
-      
       display.clearDisplay();
       display.setTextSize(1);
       display.setTextColor(SSD1306_WHITE);
@@ -655,13 +933,6 @@ void setupOTA() {
       display.display();
     })
     .onError([](ota_error_t error) {
-      Serial.printf("Error[%u]: ", error);
-      if (error == OTA_AUTH_ERROR) Serial.println("Auth Failed");
-      else if (error == OTA_BEGIN_ERROR) Serial.println("Begin Failed");
-      else if (error == OTA_CONNECT_ERROR) Serial.println("Connect Failed");
-      else if (error == OTA_RECEIVE_ERROR) Serial.println("Receive Failed");
-      else if (error == OTA_END_ERROR) Serial.println("End Failed");
-      
       display.clearDisplay();
       display.setTextSize(1);
       display.setTextColor(SSD1306_WHITE);
@@ -672,47 +943,45 @@ void setupOTA() {
     });
 
   ArduinoOTA.begin();
-  Serial.println("OTA Ready");
-  Serial.print("IP address: ");
-  Serial.println(WiFi.localIP());
 }
 
 void handleWebServer() {
   ws.onEvent(onWsEvent);
   server.addHandler(&ws);
 
-  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
-    request->send(LittleFS, "/index.html", "text/html");
-  });
+  // Serve static files
+  server.serveStatic("/", LittleFS, "/").setDefaultFile("index.html");
+  server.serveStatic("/admin", LittleFS, "/admin.html");
   
-  server.on("/style.css", HTTP_GET, [](AsyncWebServerRequest *request) {
-    request->send(LittleFS, "/style.css", "text/css");
-  });
-  
-  server.on("/script.js", HTTP_GET, [](AsyncWebServerRequest *request) {
-    request->send(LittleFS, "/script.js", "application/javascript");
+  // Add cache control for CSS/JS files
+  server.on("^\\/(?:style|admin-style|script|admin-script)\\.(?:css|js)$", HTTP_GET, [](AsyncWebServerRequest *request) {
+    String path = request->url();
+    if (path.endsWith(".css")) {
+      request->send(LittleFS, path, "text/css");
+    } else if (path.endsWith(".js")) {
+      request->send(LittleFS, path, "application/javascript");
+    }
   });
 
   server.begin();
-  Serial.println("HTTP server started");
 }
 
 void setup() {
   Serial.begin(115200);
-  Serial.println("\n\nBooting...");
   setupI2C();
 
   if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
-    Serial.println("OLED init failed");
     for (;;);
   }
 
+  // Setup encoder pins and interrupts
   for (int i = 0; i < 3; i++) {
     pinMode(encoderPins[i], INPUT_PULLUP);
   }
   attachInterrupt(digitalPinToInterrupt(encoderPins[0]), readEncoder, CHANGE);
   attachInterrupt(digitalPinToInterrupt(encoderPins[1]), readEncoder, CHANGE);
 
+  // Setup motor pins
   for (int i = 0; i < 4; i++) {
     for (int j = 0; j < 2; j++) {
       pinMode(motorPins[i][j], OUTPUT);
@@ -720,21 +989,18 @@ void setup() {
     }
   }
   
+  // Setup limit switch pins
   for (int i = 0; i < 4; i++) {
     pinMode(limitPins[i], INPUT_PULLUP);
   }
   
+  // Initialize LittleFS
   if (!LittleFS.begin()) {
-    Serial.println("LittleFS mount failed");
-    Serial.println("Formatting LittleFS...");
     LittleFS.format();
-    if (!LittleFS.begin()) {
-      Serial.println("LittleFS mount failed after formatting");
-    }
+    LittleFS.begin();
   }
-  Serial.println("LittleFS mounted successfully");
 
-  // Initialize all motor states
+  // Initialize motor states
   for (int i = 0; i < 4; i++) {
     motors[i].real_position = 0;
     motors[i].target = 0;
@@ -743,25 +1009,18 @@ void setup() {
     motors[i].fullForward = false;
     motors[i].fullBackward = false;
     motors[i].calibrating = false;
-    Serial.printf("Motor %d initialized\n", i);
   }
 
+  // WiFi setup
   wm.setConfigPortalTimeout(180);
   wm.setHostname("esp32-stanok");
   
   bool res = wm.autoConnect("ESP32-Config", "config123");
   
   if (!res) {
-    Serial.println("Failed to connect or configure");
     ESP.restart();
   }
   
-  Serial.println("WiFi connected!");
-  Serial.print("IP address: ");
-  Serial.println(WiFi.localIP());
-  Serial.print("Hostname: ");
-  Serial.println(WiFi.getHostname());
-
   displayStartTime = millis();
   drawIPDisplay();
 
@@ -769,12 +1028,15 @@ void setup() {
   handleWebServer();
 
   setServoState(false);
-  
-  Serial.println("Setup complete!");
 }
 
 void loop() {
   ArduinoOTA.handle();
+  
+  if (updateInProgress) {
+    delay(100);
+    return;
+  }
   
   if (millis() - displayStartTime < 10000) {
     if (showIP) {
@@ -786,29 +1048,26 @@ void loop() {
     }
   } else {
     // Handle encoder scrolling
-    if (encoder_delta != 0) {
-      if (millis() - lastEncoderUpdate > ENCODER_DEBOUNCE) {
-        lastEncoderUpdate = millis();
+    if (encoder_delta != 0 && millis() - lastEncoderUpdate > ENCODER_DEBOUNCE) {
+      lastEncoderUpdate = millis();
+      
+      int8_t delta = (encoder_delta > 0) ? 1 : -1;
+      
+      if (menu_level == 4 && edit_value) {
+        motors[selected_motor].target = constrain(motors[selected_motor].target + delta, min_mm, max_mm);
+      } else if (menu_level < 7) {
+        menu_index[menu_level] += delta;
         
-        int8_t delta = (encoder_delta > 0) ? 1 : -1;
-        
-        if (menu_level == 4 && edit_value) {
-          motors[selected_motor].target += delta;
-          if (motors[selected_motor].target < min_mm) motors[selected_motor].target = min_mm;
-          if (motors[selected_motor].target > max_mm) motors[selected_motor].target = max_mm;
-        } else {
-          menu_index[menu_level] += delta;
-          
-          int max_indices[] = {2, 2, 4, 3, 3, 4, 1};
-          menu_index[menu_level] = constrain(menu_index[menu_level], 0, max_indices[menu_level]);
-        }
-        
-        encoder_delta = 0;
-        drawMenu();
-        sendState();
+        static const int8_t max_indices[] = {2, 2, 4, 3, 3, 4, 1};
+        menu_index[menu_level] = constrain(menu_index[menu_level], 0, max_indices[menu_level]);
       }
+      
+      encoder_delta = 0;
+      drawMenu();
+      sendState();
     }
 
+    // Handle encoder button
     bool btnState = digitalRead(encoderPins[2]);
     if (btnState == LOW && !btnPressed && millis() - lastDebounce > 300) {
       btnPressed = true;
@@ -816,39 +1075,20 @@ void loop() {
 
       switch (menu_level) {
         case 0:
-          if (menu_index[0] == 0) {
-            menu_level = 1;
-            menu_index[1] = 0;
-          } else if (menu_index[0] == 1) {
-            menu_level = 5;
-            menu_index[5] = 0;
-          } else if (menu_index[0] == 2) {
-            menu_level = 6;
-            menu_index[6] = 0;
-          }
+          if (menu_index[0] == 0) menu_level = 1;
+          else if (menu_index[0] == 1) menu_level = 5;
+          else if (menu_index[0] == 2) menu_level = 6;
           break;
           
         case 1:
-          if (menu_index[1] == 0) {
-            menu_level = 3;
-            menu_index[3] = 0;
-            selected_motor = -1;
-          } else if (menu_index[1] == 1) {
-            menu_level = 2;
-            menu_index[2] = 0;
-          } else if (menu_index[1] == 2) {
-            menu_level = 0;
-          }
+          if (menu_index[1] == 0) { menu_level = 3; selected_motor = -1; }
+          else if (menu_index[1] == 1) menu_level = 2;
+          else if (menu_index[1] == 2) menu_level = 0;
           break;
           
         case 2:
-          if (menu_index[2] == 4) {
-            menu_level = 1;
-          } else {
-            selected_motor = menu_index[2];
-            menu_level = 3;
-            menu_index[3] = 0;
-          }
+          if (menu_index[2] == 4) menu_level = 1;
+          else { selected_motor = menu_index[2]; menu_level = 3; }
           break;
           
         case 3:
@@ -858,62 +1098,40 @@ void loop() {
           } 
           else if (selected_action == 0) {
             menu_level = 4;
-            menu_index[4] = 0;
             edit_value = false;
           } 
           else if (selected_action == 1) {
-            if (selected_motor == -1) {
-              toggleAllFullForward();
-            } else {
-              toggleFullForward(selected_motor);
-            }
+            (selected_motor == -1) ? toggleAllFullForward() : toggleFullForward(selected_motor);
           }
           else if (selected_action == 2) {
-            if (selected_motor == -1) {
-              toggleAllFullBackward();
-            } else {
-              toggleFullBackward(selected_motor);
-            }
+            (selected_motor == -1) ? toggleAllFullBackward() : toggleFullBackward(selected_motor);
           }
           break;
           
         case 4:
-          if (menu_index[4] == 0) {
-            edit_value = !edit_value;
-          } 
+          if (menu_index[4] == 0) edit_value = !edit_value;
           else if (menu_index[4] == 2) {
             if (selected_motor == -1) {
-              for (int i = 0; i < 4; i++) {
-                setMotorTarget(i, motors[i].target);
-              }
+              for (int i = 0; i < 4; i++) setMotorTarget(i, motors[i].target);
             } else {
               setMotorTarget(selected_motor, motors[selected_motor].target);
             }
           } 
-          else if (menu_index[4] == 3) {
-            menu_level = 3;
-            edit_value = false;
-          }
+          else if (menu_index[4] == 3) { menu_level = 3; edit_value = false; }
           break;
           
         case 5:
-          if (menu_index[5] == 4) {
-            menu_level = 0;
-          } else {
-            toggleCalibration(menu_index[5]);
-          }
+          if (menu_index[5] == 4) menu_level = 0;
+          else toggleCalibration(menu_index[5]);
           break;
           
         case 6:
-          if (menu_index[6] == 0) {
-            setServoState(!servoState);
-          } 
-          else if (menu_index[6] == 1) {
-            menu_level = 0;
-          }
+          if (menu_index[6] == 0) setServoState(!servoState);
+          else if (menu_index[6] == 1) menu_level = 0;
           break;
       }
       
+      menu_index[menu_level] = 0;
       drawMenu();
       sendState();
     } else if (btnState == HIGH && btnPressed) {
@@ -931,8 +1149,8 @@ void loop() {
       }
     }
 
-    // Update motor positions - ONLY when moving to a target (not in full forward/backward mode)
-    unsigned long current_time = millis();
+    // Update motor positions
+    uint32_t current_time = millis();
     for (int i = 0; i < 4; i++) {
       if (motors[i].running && !motors[i].fullForward && !motors[i].fullBackward) {
         if (current_time - motors[i].last_position_update >= ms_per_mm) {
@@ -940,14 +1158,9 @@ void loop() {
           
           if (motors[i].dir > 0) {
             motors[i].real_position++;
-          } else if (motors[i].dir < 0) {
-            motors[i].real_position--;
-          }
-
-          // Update manual distance for target tracking
-          if (motors[i].dir > 0) {
             motors[i].manual_distance++;
           } else if (motors[i].dir < 0) {
+            motors[i].real_position--;
             motors[i].manual_distance--;
           }
           
@@ -959,9 +1172,8 @@ void loop() {
             }
           }
           
-          // Update web interface
           sendState();
-          drawMenu();
+          if (!updateInProgress) drawMenu();
         }
       }
     }

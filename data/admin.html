@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=5.0">
+    <title>ESP32 Motor Control - Admin</title>
+    <link rel="stylesheet" href="/admin-style.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+</head>
+<body>
+    <div class="container">
+        <!-- Header -->
+        <header class="admin-header">
+            <h1><i class="fas fa-user-shield"></i> ESP32 Admin Panel</h1>
+            <div class="admin-nav">
+                <a href="/" class="nav-link"><i class="fas fa-home"></i> Main Control</a>
+                <a href="/admin" class="nav-link active"><i class="fas fa-cog"></i> Admin</a>
+            </div>
+        </header>
+        
+        <div class="admin-dashboard">
+            <!-- System Status Card -->
+            <div class="admin-card">
+                <div class="card-header">
+                    <h3 class="card-title">
+                        <i class="fas fa-server"></i> System Status
+                    </h3>
+                </div>
+                <div class="card-body">
+                    <div class="status-grid">
+                        <div class="status-item">
+                            <div class="status-icon">
+                                <i class="fas fa-microchip"></i>
+                            </div>
+                            <div class="status-info">
+                                <h4>ESP32</h4>
+                                <p class="status-value" id="chip-info">ESP32-WROOM</p>
+                            </div>
+                        </div>
+                        <div class="status-item">
+                            <div class="status-icon">
+                                <i class="fas fa-wifi"></i>
+                            </div>
+                            <div class="status-info">
+                                <h4>WiFi Status</h4>
+                                <p class="status-value" id="wifi-status">Connected</p>
+                            </div>
+                        </div>
+                        <div class="status-item">
+                            <div class="status-icon">
+                                <i class="fas fa-memory"></i>
+                            </div>
+                            <div class="status-info">
+                                <h4>Free Heap</h4>
+                                <p class="status-value" id="free-heap">0 KB</p>
+                            </div>
+                        </div>
+                        <div class="status-item">
+                            <div class="status-icon">
+                                <i class="fas fa-clock"></i>
+                            </div>
+                            <div class="status-info">
+                                <h4>Uptime</h4>
+                                <p class="status-value" id="uptime">00:00:00</p>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div class="ip-display">
+                        <p><i class="fas fa-network-wired"></i> IP Address: <strong id="ip-address">---</strong></p>
+                        <p><i class="fas fa-signal"></i> RSSI: <strong id="wifi-rssi">--- dBm</strong></p>
+                        <p><i class="fas fa-satellite-dish"></i> Hostname: <strong id="hostname">---</strong></p>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- OTA Update Card -->
+            <div class="admin-card">
+                <div class="card-header">
+                    <h3 class="card-title">
+                        <i class="fas fa-cloud-download-alt"></i> OTA Update from GitHub
+                    </h3>
+                </div>
+                <div class="card-body">
+                    <div class="update-info">
+                        <div class="info-row">
+                            <span class="info-label">Current Version:</span>
+                            <span class="info-value" id="current-version">1.0.0</span>
+                        </div>
+                        <div class="info-row">
+                            <span class="info-label">Latest Version:</span>
+                            <span class="info-value" id="latest-version">Checking...</span>
+                        </div>
+                        <div class="info-row">
+                            <span class="info-label">Repository:</span>
+                            <span class="info-value">YuraKabacho/stanok</span>
+                        </div>
+                    </div>
+                    
+                    <div class="update-progress" id="update-progress" style="display: none;">
+                        <div class="progress-header">
+                            <h4>Update Progress</h4>
+                            <span id="update-percentage">0%</span>
+                        </div>
+                        <div class="progress-bar">
+                            <div class="progress-fill" id="update-progress-bar"></div>
+                        </div>
+                        <div class="progress-status" id="update-status">
+                            Initializing...
+                        </div>
+                    </div>
+                    
+                    <div class="update-actions">
+                        <button class="btn btn-check-update" id="check-update-button">
+                            <i class="fas fa-sync-alt"></i> Check for Updates
+                        </button>
+                        <button class="btn btn-update" id="start-update-button" disabled>
+                            <i class="fas fa-download"></i> Install Update
+                        </button>
+                    </div>
+                    
+                    <div class="update-note">
+                        <p><i class="fas fa-info-circle"></i> The system will automatically reboot after update.</p>
+                        <p><i class="fas fa-exclamation-triangle"></i> <strong>Warning:</strong> Do not power off during update!</p>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- System Control Card -->
+            <div class="admin-card">
+                <div class="card-header">
+                    <h3 class="card-title">
+                        <i class="fas fa-cogs"></i> System Controls
+                    </h3>
+                </div>
+                <div class="card-body">
+                    <div class="control-grid">
+                        <button class="btn btn-control btn-restart" id="restart-button">
+                            <i class="fas fa-redo"></i> Restart ESP32
+                        </button>
+                        <button class="btn btn-control btn-reset" id="reset-wifi-button">
+                            <i class="fas fa-wifi-slash"></i> Reset WiFi
+                        </button>
+                        <button class="btn btn-control btn-format" id="format-fs-button">
+                            <i class="fas fa-trash-alt"></i> Format Filesystem
+                        </button>
+                        <button class="btn btn-control btn-calibrate" id="calibrate-all-button">
+                            <i class="fas fa-ruler-combined"></i> Calibrate All Motors
+                        </button>
+                    </div>
+                    
+                    <div class="emergency-section">
+                        <button class="btn btn-emergency" id="emergency-stop-button">
+                            <i class="fas fa-exclamation-triangle"></i> Emergency Stop All Motors
+                        </button>
+                        <p class="emergency-note">Immediately stops all motor movements</p>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- Network Settings Card -->
+            <div class="admin-card">
+                <div class="card-header">
+                    <h3 class="card-title">
+                        <i class="fas fa-network-wired"></i> Network Settings
+                    </h3>
+                </div>
+                <div class="card-body">
+                    <div class="form-group">
+                        <label for="hostname-input">Device Hostname</label>
+                        <div class="input-with-button">
+                            <input type="text" id="hostname-input" value="esp32-stanok" class="form-input">
+                            <button class="btn btn-small" id="set-hostname-button">
+                                <i class="fas fa-save"></i> Set
+                            </button>
+                        </div>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="ota-password-input">OTA Password</label>
+                        <div class="input-with-button">
+                            <input type="password" id="ota-password-input" value="ota123" class="form-input">
+                            <button class="btn btn-small" id="set-ota-password-button">
+                                <i class="fas fa-save"></i> Set
+                            </button>
+                        </div>
+                    </div>
+                    
+                    <div class="wifi-manager">
+                        <p><i class="fas fa-wifi"></i> To change WiFi network, restart in configuration mode:</p>
+                        <button class="btn btn-wifi-config" id="wifi-config-button">
+                            <i class="fas fa-cog"></i> Start WiFi Configuration Portal
+                        </button>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- Logs Card -->
+            <div class="admin-card">
+                <div class="card-header">
+                    <h3 class="card-title">
+                        <i class="fas fa-clipboard-list"></i> System Logs
+                    </h3>
+                    <button class="btn btn-small btn-clear" id="clear-logs-button">
+                        <i class="fas fa-trash"></i> Clear
+                    </button>
+                </div>
+                <div class="card-body">
+                    <div class="logs-container" id="logs-container">
+                        <div class="log-entry">
+                            <span class="log-time">[00:00:00]</span>
+                            <span class="log-message">System started</span>
+                        </div>
+                    </div>
+                    <div class="log-controls">
+                        <button class="btn btn-small" id="refresh-logs-button">
+                            <i class="fas fa-sync-alt"></i> Refresh
+                        </button>
+                        <label class="checkbox-label">
+                            <input type="checkbox" id="auto-refresh-logs" checked>
+                            Auto-refresh logs
+                        </label>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Connection Status -->
+        <div class="connection-status">
+            <div class="status-indicator" id="connection-indicator">
+                <div class="status-dot"></div>
+                <span id="connection-text">Connecting...</span>
+            </div>
+            <div class="status-time">
+                Last update: <span id="last-update-time">Just now</span>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Confirmation Modal -->
+    <div class="modal" id="confirmation-modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3 id="modal-title">Confirmation</h3>
+                <button class="modal-close" id="modal-close">&times;</button>
+            </div>
+            <div class="modal-body">
+                <p id="modal-message">Are you sure you want to proceed?</p>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" id="modal-cancel">Cancel</button>
+                <button class="btn btn-primary" id="modal-confirm">Confirm</button>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Toast Notification -->
+    <div class="toast" id="toast">
+        <div class="toast-content">
+            <i class="fas fa-info-circle toast-icon"></i>
+            <span class="toast-message" id="toast-message">Notification</span>
+        </div>
+    </div>
+
+    <script src="/admin-script.js"></script>
+</body>
+</html>

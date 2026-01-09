@@ -1,3 +1,26 @@
+// Add admin link to main page
+function addAdminLink() {
+  const mobileHeader = document.querySelector(".mobile-header");
+  if (mobileHeader) {
+    const adminLink = document.createElement("a");
+    adminLink.href = "/admin";
+    adminLink.className = "admin-link";
+    adminLink.innerHTML = '<i class="fas fa-user-shield"></i>';
+    adminLink.style.cssText = `
+      position: absolute;
+      right: 16px;
+      top: 50%;
+      transform: translateY(-50%);
+      color: white;
+      font-size: 1.2rem;
+      text-decoration: none;
+    `;
+    mobileHeader.style.position = "relative";
+    mobileHeader.appendChild(adminLink);
+  }
+}
+
+// Call this in DOMContentLoaded
 document.addEventListener("DOMContentLoaded", function () {
   let websocket;
   let lastUpdateTime = Date.now();
@@ -453,4 +476,5 @@ document.addEventListener("DOMContentLoaded", function () {
   window.addEventListener("resize", function () {
     // Update any responsive elements if needed
   });
+  addAdminLink();
 });
