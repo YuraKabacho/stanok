@@ -1,6 +1,7 @@
 document.addEventListener("DOMContentLoaded", function () {
   let websocket;
   let lastUpdateTime = Date.now();
+  let uptimeInterval;
   let pendingAction = null;
   let pendingActionData = null;
 
@@ -9,37 +10,49 @@ document.addEventListener("DOMContentLoaded", function () {
     const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
     const wsUrl = `${protocol}//${window.location.hostname}/ws`;
 
+    console.log(`Connecting to WebSocket: ${wsUrl}`);
     websocket = new WebSocket(wsUrl);
 
     websocket.onopen = function (event) {
+      console.log("WebSocket connected successfully");
       showToast("Connected to ESP32", "success");
       updateConnectionStatus(true);
+      startUptimeCounter();
+
+      // Request initial state
       sendCommand("get_ip", {});
     };
 
     websocket.onclose = function (event) {
+      console.log("WebSocket disconnected", event.code, event.reason);
       showToast("Disconnected from ESP32", "warning");
       updateConnectionStatus(false);
+
+      // Try to reconnect
       setTimeout(connectWebSocket, 3000);
     };
 
     websocket.onerror = function (error) {
+      console.error("WebSocket error:", error);
       updateConnectionStatus(false);
     };
 
     websocket.onmessage = function (event) {
       try {
         const data = JSON.parse(event.data);
+        console.log("Received data:", data);
         lastUpdateTime = Date.now();
         updateInterface(data);
       } catch (error) {
-        console.error("Error parsing JSON:", error);
+        console.error("Error parsing JSON:", error, "Raw data:", event.data);
       }
     };
   }
 
   // Update interface with data from ESP32
   function updateInterface(data) {
+    console.log("Updating admin interface with data:", data);
+
     // Update IP address
     if (data.ip) {
       document.getElementById("ip-address").textContent = data.ip;
@@ -54,46 +67,6 @@ document.addEventListener("DOMContentLoaded", function () {
     if (data.updateInProgress !== undefined) {
       updateOTAStatus(data);
     }
-
-    // Handle update info response
-    if (data.type === "update_info") {
-      handleUpdateInfo(data.data);
-    }
-  }
-
-  // Handle update information from GitHub
-  function handleUpdateInfo(data) {
-    const latestVersionElem = document.getElementById("latest-version");
-    const startUpdateButton = document.getElementById("start-update-button");
-    const updateLittlefsButton = document.getElementById(
-      "update-littlefs-button"
-    );
-
-    if (data.latest_version) {
-      latestVersionElem.textContent = data.latest_version;
-    }
-
-    if (data.firmware_url) {
-      startUpdateButton.disabled = false;
-      startUpdateButton.dataset.url = data.firmware_url;
-      startUpdateButton.title = "Update to version " + data.latest_version;
-    } else {
-      startUpdateButton.disabled = true;
-      startUpdateButton.title = "No firmware update available";
-    }
-
-    if (data.littlefs_url) {
-      updateLittlefsButton.disabled = false;
-      updateLittlefsButton.dataset.url = data.littlefs_url;
-    } else {
-      updateLittlefsButton.disabled = true;
-    }
-
-    if (!data.firmware_url && !data.littlefs_url) {
-      showToast("No updates available", "warning");
-    } else {
-      showToast("Update check complete", "success");
-    }
   }
 
   // Update OTA status
@@ -103,9 +76,6 @@ document.addEventListener("DOMContentLoaded", function () {
     const progressPercent = document.getElementById("update-percentage");
     const updateStatus = document.getElementById("update-status");
     const startUpdateButton = document.getElementById("start-update-button");
-    const updateLittlefsButton = document.getElementById(
-      "update-littlefs-button"
-    );
     const checkUpdateButton = document.getElementById("check-update-button");
 
     if (data.updateInProgress) {
@@ -115,24 +85,14 @@ document.addEventListener("DOMContentLoaded", function () {
       updateStatus.textContent = data.updateStatus || "Updating...";
 
       startUpdateButton.disabled = true;
-      updateLittlefsButton.disabled = true;
       checkUpdateButton.disabled = true;
     } else {
       if (data.updateStatus) {
         updateStatus.textContent = data.updateStatus;
         if (data.updateProgress === 100) {
-          if (data.updateType === "firmware") {
-            showToast(
-              "Firmware update complete! Device will restart.",
-              "success"
-            );
-          } else {
-            showToast("LittleFS update complete!", "success");
-          }
+          showToast("Update complete! Device will restart.", "success");
           setTimeout(() => {
             updateProgress.style.display = "none";
-            progressBar.style.width = "0%";
-            progressPercent.textContent = "0%";
           }, 3000);
         } else if (
           data.updateStatus.includes("error") ||
@@ -143,7 +103,6 @@ document.addEventListener("DOMContentLoaded", function () {
       }
 
       startUpdateButton.disabled = false;
-      updateLittlefsButton.disabled = false;
       checkUpdateButton.disabled = false;
     }
 
@@ -169,6 +128,25 @@ document.addEventListener("DOMContentLoaded", function () {
     document.getElementById("last-update-time").textContent = "Just now";
   }
 
+  // Start uptime counter
+  function startUptimeCounter() {
+    let seconds = 0;
+    clearInterval(uptimeInterval);
+
+    uptimeInterval = setInterval(() => {
+      seconds++;
+      const hours = Math.floor(seconds / 3600);
+      const minutes = Math.floor((seconds % 3600) / 60);
+      const secs = seconds % 60;
+
+      document.getElementById("uptime").textContent = `${hours
+        .toString()
+        .padStart(2, "0")}:${minutes.toString().padStart(2, "0")}:${secs
+        .toString()
+        .padStart(2, "0")}`;
+    }, 1000);
+  }
+
   // Send command to ESP32
   function sendCommand(type, data) {
     if (websocket && websocket.readyState === WebSocket.OPEN) {
@@ -178,8 +156,13 @@ document.addEventListener("DOMContentLoaded", function () {
         timestamp: Date.now(),
       };
       websocket.send(JSON.stringify(command));
+      console.log("Sent command:", command);
     } else {
       showToast("No connection to ESP32", "warning");
+      console.error(
+        "WebSocket is not open. ReadyState:",
+        websocket ? websocket.readyState : "no socket"
+      );
     }
   }
 
@@ -236,51 +219,23 @@ document.addEventListener("DOMContentLoaded", function () {
         showToast("Checking for updates...", "success");
 
         setTimeout(() => {
-          sendCommand("check_updates", {});
+          sendCommand("check_update", {});
           this.disabled = false;
         }, 1000);
       });
 
-    // Start firmware update button
+    // Start update button
     document
       .getElementById("start-update-button")
       .addEventListener("click", function () {
-        const url = this.dataset.url;
-        if (url) {
-          showConfirmation(
-            "Update Firmware",
-            "Are you sure you want to update the firmware? The device will restart after update. Do not power off during update!",
-            function () {
-              sendCommand("update_firmware", { url: url });
-              showToast("Starting firmware update...", "success");
-            }
-          );
-        }
-      });
-
-    // Update LittleFS button
-    const updateLittlefsButton = document.createElement("button");
-    updateLittlefsButton.id = "update-littlefs-button";
-    updateLittlefsButton.className = "btn btn-update btn-littlefs";
-    updateLittlefsButton.innerHTML =
-      '<i class="fas fa-hdd"></i> Update LittleFS';
-    updateLittlefsButton.disabled = true;
-
-    document.querySelector(".update-actions").appendChild(updateLittlefsButton);
-
-    updateLittlefsButton.addEventListener("click", function () {
-      const url = this.dataset.url;
-      if (url) {
         showConfirmation(
-          "Update LittleFS",
-          "Are you sure you want to update the filesystem? This will replace all web files. The device will not restart.",
+          "Start OTA Update",
+          "Are you sure you want to start the OTA update? The device will restart after update. Do not power off during update!",
           function () {
-            sendCommand("update_littlefs", { url: url });
-            showToast("Starting LittleFS update...", "success");
+            sendCommand("check_update", {});
           }
         );
-      }
-    });
+      });
 
     // Restart button
     document
@@ -290,6 +245,7 @@ document.addEventListener("DOMContentLoaded", function () {
           "Restart ESP32",
           "Are you sure you want to restart the ESP32? All current operations will be interrupted.",
           function () {
+            sendCommand("restart", {});
             showToast("Restarting ESP32...", "success");
           }
         );
@@ -301,8 +257,9 @@ document.addEventListener("DOMContentLoaded", function () {
       .addEventListener("click", function () {
         showConfirmation(
           "Reset WiFi Settings",
-          "This will reset all WiFi settings and restart in configuration mode.",
+          "This will reset all WiFi settings and restart in configuration mode. You will need to reconnect to the ESP32's AP to configure WiFi again.",
           function () {
+            sendCommand("reset_wifi", {});
             showToast("WiFi settings reset. Reconnecting...", "warning");
           }
         );
@@ -314,8 +271,9 @@ document.addEventListener("DOMContentLoaded", function () {
       .addEventListener("click", function () {
         showConfirmation(
           "Format Filesystem",
-          "WARNING: This will erase all files from the filesystem! This action cannot be undone.",
+          "WARNING: This will erase all files from the filesystem including web pages and configuration! This action cannot be undone.",
           function () {
+            sendCommand("format_fs", {});
             showToast("Formatting filesystem...", "warning");
           }
         );
@@ -327,7 +285,7 @@ document.addEventListener("DOMContentLoaded", function () {
       .addEventListener("click", function () {
         showConfirmation(
           "Calibrate All Motors",
-          "This will start calibration for all motors.",
+          "This will start calibration for all motors. Make sure there is enough space for motors to move to limit switches.",
           function () {
             sendCommand("calibrate_all", {});
             showToast("Starting calibration of all motors...", "success");
@@ -375,7 +333,9 @@ document.addEventListener("DOMContentLoaded", function () {
     const timeSinceLastUpdate = now - lastUpdateTime;
 
     if (timeSinceLastUpdate > 15000) {
+      // 15 seconds without updates
       if (websocket && websocket.readyState === WebSocket.OPEN) {
+        console.log("No updates for 15 seconds, sending ping");
         sendCommand("get_ip", {});
       }
     }
